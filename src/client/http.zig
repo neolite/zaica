@@ -106,7 +106,24 @@ pub fn streamChatCompletion(
     var line_reader = sse.LineReader(http.Client.Request.Reader).init(req.reader());
     var line_buf: [16 * 1024]u8 = undefined;
 
+    // Some APIs return plain JSON errors with HTTP 200 (e.g. GLM rate limits).
+    // Detect this: if first line starts with '{', it's not SSE.
+    var first_line = true;
+
     while (try line_reader.nextLine(&line_buf)) |line| {
+        if (first_line and line.len > 0 and line[0] == '{') {
+            // Plain JSON response — likely an error
+            const stderr = std.io.getStdErr().writer();
+            if (extractErrorMessage(allocator, line)) |msg| {
+                defer allocator.free(msg);
+                stderr.print("Error: {s}\n", .{msg}) catch {};
+            } else {
+                stderr.print("Error: {s}\n", .{line}) catch {};
+            }
+            return StreamError.ApiError;
+        }
+        first_line = false;
+
         const event = sse.parseSseLine(allocator, line) catch continue;
         switch (event) {
             .content => |content| {

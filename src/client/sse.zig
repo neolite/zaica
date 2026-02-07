@@ -70,10 +70,19 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseEvent {
         }
     }
 
-    const content = delta.object.get("content") orelse return .skip;
-    if (content != .string or content.string.len == 0) return .skip;
+    // Try content first, then reasoning_content (GLM reasoning models)
+    if (delta.object.get("content")) |content| {
+        if (content == .string and content.string.len > 0) {
+            return .{ .content = try allocator.dupe(u8, content.string) };
+        }
+    }
+    if (delta.object.get("reasoning_content")) |rc| {
+        if (rc == .string and rc.string.len > 0) {
+            return .{ .content = try allocator.dupe(u8, rc.string) };
+        }
+    }
 
-    return .{ .content = try allocator.dupe(u8, content.string) };
+    return .skip;
 }
 
 /// Line reader that buffers across chunk boundaries.
