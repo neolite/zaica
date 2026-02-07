@@ -1,0 +1,11 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Secrets
+.env
+auth.json
+
+# OS
+.DS_Store
