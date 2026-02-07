@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config/mod.zig");
+const client = @import("client/mod.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,17 +34,16 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    // TODO: LLM client — send prompt to provider
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Provider: {s}\nModel: {s}\nEndpoint: {s}\nPrompt: {s}\n\n(LLM client not yet implemented)\n", .{
-        result.resolved.config.provider,
-        result.resolved.resolved_model,
-        result.resolved.completions_url,
-        result.prompt.?,
-    });
+    // Send prompt to LLM provider
+    const response = client.chat(allocator, &result.resolved, result.prompt.?) catch {
+        // client.chat prints user-friendly errors to stderr
+        std.process.exit(1);
+    };
+    defer allocator.free(response);
 }
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("config/mod.zig");
+    _ = @import("client/mod.zig");
 }
