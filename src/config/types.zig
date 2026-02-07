@@ -51,7 +51,7 @@ pub const ResolvedAuth = struct {
 
     pub const KeySource = enum {
         cli_flag,
-        zagent_env,
+        zaica_env,
         provider_env,
         auth_file,
         none,

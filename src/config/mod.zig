@@ -1,11 +1,11 @@
-/// Config module — loads, merges, and validates zagent configuration.
+/// Config module — loads, merges, and validates zaica configuration.
 ///
 /// Priority (lowest to highest):
 ///   1. Comptime defaults (Config struct defaults)
 ///   2. Provider presets (built-in for GLM, OpenAI, etc.)
-///   3. ~/.config/zagent/config.json (global)
-///   4. .zagent.json (project-level)
-///   5. Environment variables (ZAGENT_*)
+///   3. ~/.config/zaica/config.json (global)
+///   4. .zaica.json (project-level)
+///   5. Environment variables (ZAICA_*)
 ///   6. CLI flags (--provider, --model, ...)
 pub const types = @import("types.zig");
 pub const presets = @import("presets.zig");

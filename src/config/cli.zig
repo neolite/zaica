@@ -73,7 +73,7 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
                 result.show_help = true;
             } else {
                 const stderr = std.io.getStdErr().writer();
-                stderr.print("Unknown flag: {s}\nTry 'zagent --help' for more information.\n", .{arg}) catch {};
+                stderr.print("Unknown flag: {s}\nTry 'zc --help' for more information.\n", .{arg}) catch {};
                 return error.UnknownFlag;
             }
         } else {
@@ -102,10 +102,10 @@ pub fn printHelp() void {
 }
 
 const help_text =
-    \\zagent — AI coding assistant
+    \\zc — Zig AI Coding Assistant
     \\
     \\USAGE:
-    \\  zagent [OPTIONS] <prompt...>
+    \\  zc [OPTIONS] <prompt...>
     \\
     \\OPTIONS:
     \\  -p, --provider <name>      LLM provider (glm, openai, anthropic, deepseek, ollama)
@@ -115,24 +115,24 @@ const help_text =
     \\  --api-key <key>            API key (overrides all other key sources)
     \\  --config <path>            Path to config file
     \\  --dump-config              Print resolved configuration and exit
-    \\  --init                     Create default config files in ~/.config/zagent/
+    \\  --init                     Create default config files in ~/.config/zc/
     \\  -h, --help                 Show this help
     \\
     \\EXAMPLES:
-    \\  zagent "explain this code"
-    \\  zagent --provider glm --model glm-4.7-flash "hello"
-    \\  zagent --init
-    \\  zagent --dump-config
+    \\  zc "explain this code"
+    \\  zc --provider glm --model glm-4.7-flash "hello"
+    \\  zc --init
+    \\  zc --dump-config
     \\
     \\CONFIG FILES:
-    \\  ~/.config/zagent/config.json   Global configuration
-    \\  ~/.config/zagent/auth.json     API keys (chmod 600)
-    \\  .zagent.json                   Project-level overrides
+    \\  ~/.config/zc/config.json   Global configuration
+    \\  ~/.config/zc/auth.json     API keys (chmod 600)
+    \\  .zc.json                   Project-level overrides
     \\
     \\ENVIRONMENT:
-    \\  ZAGENT_PROVIDER       Override provider
-    \\  ZAGENT_MODEL          Override model
-    \\  ZAGENT_API_KEY        API key (any provider)
+    \\  ZAICA_PROVIDER       Override provider
+    \\  ZAICA_MODEL          Override model
+    \\  ZAICA_API_KEY        API key (any provider)
     \\  GLM_API_KEY           GLM-specific API key
     \\  OPENAI_API_KEY        OpenAI-specific API key
     \\  ANTHROPIC_API_KEY     Anthropic-specific API key

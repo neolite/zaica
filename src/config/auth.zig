@@ -5,7 +5,7 @@ const env_mod = @import("env.zig");
 
 /// Resolve the API key for a provider using the priority chain:
 /// 1. CLI --api-key flag
-/// 2. ZAGENT_API_KEY env var
+/// 2. ZAICA_API_KEY env var
 /// 3. {PROVIDER}_API_KEY env var (e.g. GLM_API_KEY)
 /// 4. auth.json → keys.{provider}
 /// Returns ResolvedAuth with key and source info.
@@ -23,11 +23,11 @@ pub fn resolveApiKey(
         };
     }
 
-    // 2. ZAGENT_API_KEY
-    if (env_mod.getEnv("ZAGENT_API_KEY")) |key| {
+    // 2. ZAICA_API_KEY
+    if (env_mod.getEnv("ZAICA_API_KEY")) |key| {
         return .{
             .api_key = try allocator.dupe(u8, key),
-            .key_source = .zagent_env,
+            .key_source = .zaica_env,
         };
     }
 
@@ -52,10 +52,10 @@ pub fn resolveApiKey(
     return .{ .api_key = null, .key_source = .none };
 }
 
-/// Load API key from ~/.config/zagent/auth.json.
+/// Load API key from ~/.config/zaica/auth.json.
 fn loadAuthFile(allocator: std.mem.Allocator, provider_name: []const u8) !?[]const u8 {
     const home = env_mod.getEnv("HOME") orelse return null;
-    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zagent/auth.json", .{home});
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zaica/auth.json", .{home});
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -101,26 +101,26 @@ fn loadAuthFile(allocator: std.mem.Allocator, provider_name: []const u8) !?[]con
 /// Build the auth.json path for init command.
 pub fn getAuthFilePath(allocator: std.mem.Allocator) !?[]const u8 {
     const home = env_mod.getEnv("HOME") orelse return null;
-    return try std.fmt.allocPrint(allocator, "{s}/.config/zagent/auth.json", .{home});
+    return try std.fmt.allocPrint(allocator, "{s}/.config/zaica/auth.json", .{home});
 }
 
 /// Get the config directory path.
 pub fn getConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
     const home = env_mod.getEnv("HOME") orelse return null;
-    return try std.fmt.allocPrint(allocator, "{s}/.config/zagent", .{home});
+    return try std.fmt.allocPrint(allocator, "{s}/.config/zaica", .{home});
 }
 
 /// Format a helpful error message when no API key is found.
 pub fn formatKeyError(writer: anytype, provider_name: []const u8, provider_key_env: ?[]const u8) !void {
     try writer.print("Error: No API key found for provider '{s}'.\n\n", .{provider_name});
     try writer.writeAll("Set it using one of these methods (highest priority first):\n");
-    try writer.writeAll("  1. CLI flag:     zagent --api-key <key> ...\n");
-    try writer.writeAll("  2. Env var:      export ZAGENT_API_KEY=<key>\n");
+    try writer.writeAll("  1. CLI flag:     zc --api-key <key> ...\n");
+    try writer.writeAll("  2. Env var:      export ZAICA_API_KEY=<key>\n");
     if (provider_key_env) |env_name| {
         try writer.print("  3. Provider env: export {s}=<key>\n", .{env_name});
     }
-    try writer.writeAll("  4. Auth file:    ~/.config/zagent/auth.json\n\n");
-    try writer.writeAll("To create a default auth file, run: zagent --init\n");
+    try writer.writeAll("  4. Auth file:    ~/.config/zaica/auth.json\n\n");
+    try writer.writeAll("To create a default auth file, run: zc --init\n");
 }
 
 test "resolveApiKey: returns none when nothing set" {

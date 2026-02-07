@@ -1,7 +1,7 @@
 .{
-    .name = .zagent,
+    .name = .zaica,
     .version = "0.1.0",
-    .fingerprint = 0xfbd2e4840b253dd1,
+    .fingerprint = 0xc5b9061095f47fe6,
     .minimum_zig_version = "0.14.0",
     .dependencies = .{},
     .paths = .{

@@ -30,7 +30,7 @@ pub fn main() !void {
     // Must have a prompt to proceed
     if (result.prompt == null) {
         const stderr = std.io.getStdErr().writer();
-        stderr.writeAll("Error: No prompt provided.\nUsage: zagent [OPTIONS] <prompt...>\nTry 'zagent --help' for more information.\n") catch {};
+        stderr.writeAll("Error: No prompt provided.\nUsage: zc [OPTIONS] <prompt...>\nTry 'zc --help' for more information.\n") catch {};
         std.process.exit(1);
     }
 

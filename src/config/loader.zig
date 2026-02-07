@@ -15,7 +15,7 @@ pub fn loadConfig(
     // Start with empty object — Config struct defaults handle missing fields
     var merged: json.Value = .{ .object = json.ObjectMap.init(arena) };
 
-    // Layer 2: Global config file (~/.config/zagent/config.json or --config)
+    // Layer 2: Global config file (~/.config/zaica/config.json or --config)
     if (cli.config_path) |path| {
         if (try readJsonFile(arena, path)) |val| {
             merged = try merge.deepMerge(arena, merged, val);
@@ -26,12 +26,12 @@ pub fn loadConfig(
         }
     }
 
-    // Layer 3: Project config (.zagent.json in cwd)
+    // Layer 3: Project config (.zaica.json in cwd)
     if (try readProjectConfig(arena)) |val| {
         merged = try merge.deepMerge(arena, merged, val);
     }
 
-    // Layer 4: Environment variables (ZAGENT_*)
+    // Layer 4: Environment variables (ZAICA_*)
     if (try env_mod.readEnvOverrides(arena)) |val| {
         merged = try merge.deepMerge(arena, merged, val);
     }
@@ -114,10 +114,10 @@ fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !?json.Value {
     return cloned;
 }
 
-/// Read the relative-path .zagent.json, returning null if not found.
+/// Read the relative-path .zaica.json, returning null if not found.
 fn readProjectConfig(allocator: std.mem.Allocator) !?json.Value {
     const cwd = std.fs.cwd();
-    const file = cwd.openFile(".zagent.json", .{}) catch |err| switch (err) {
+    const file = cwd.openFile(".zaica.json", .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return null,
     };
@@ -128,7 +128,7 @@ fn readProjectConfig(allocator: std.mem.Allocator) !?json.Value {
 
     const parsed = json.parseFromSlice(json.Value, allocator, content, .{}) catch |err| {
         const stderr = std.io.getStdErr().writer();
-        stderr.print("Warning: Invalid JSON in '.zagent.json': {}\n", .{err}) catch {};
+        stderr.print("Warning: Invalid JSON in '.zaica.json': {}\n", .{err}) catch {};
         return null;
     };
     const cloned = try merge.cloneValue(allocator, parsed.value);
@@ -136,10 +136,10 @@ fn readProjectConfig(allocator: std.mem.Allocator) !?json.Value {
     return cloned;
 }
 
-/// Read global config from ~/.config/zagent/config.json.
+/// Read global config from ~/.config/zaica/config.json.
 fn readGlobalConfig(allocator: std.mem.Allocator) !?json.Value {
     const home = env_mod.getEnv("HOME") orelse return null;
-    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zagent/config.json", .{home});
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zaica/config.json", .{home});
     defer allocator.free(path);
     return readJsonFile(allocator, path);
 }
@@ -185,7 +185,7 @@ pub fn initConfigFiles() !void {
 
     // Create config directory
     var buf: [1024]u8 = undefined;
-    const config_dir = try std.fmt.bufPrint(&buf, "{s}/.config/zagent", .{home});
+    const config_dir = try std.fmt.bufPrint(&buf, "{s}/.config/zaica", .{home});
     std.fs.makeDirAbsolute(std.fs.path.dirname(config_dir).?) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
@@ -247,9 +247,9 @@ pub fn initConfigFiles() !void {
     try stdout.writeAll(
         \\
         \\Setup complete! Next steps:
-        \\  1. Add your API key to ~/.config/zagent/auth.json
+        \\  1. Add your API key to ~/.config/zaica/auth.json
         \\     OR set GLM_API_KEY environment variable
-        \\  2. Run: zagent "hello"
+        \\  2. Run: zc "hello"
         \\
     );
 }

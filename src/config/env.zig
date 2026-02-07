@@ -2,7 +2,7 @@ const std = @import("std");
 const json = std.json;
 const merge = @import("merge.zig");
 
-/// ZAGENT_* environment variable mappings to config JSON paths.
+/// ZAICA_* environment variable mappings to config JSON paths.
 const EnvMapping = struct {
     env_name: []const u8,
     json_key: []const u8,
@@ -10,15 +10,15 @@ const EnvMapping = struct {
 };
 
 const mappings = [_]EnvMapping{
-    .{ .env_name = "ZAGENT_PROVIDER", .json_key = "provider", .value_type = .string },
-    .{ .env_name = "ZAGENT_MODEL", .json_key = "model", .value_type = .string },
-    .{ .env_name = "ZAGENT_MAX_TOKENS", .json_key = "max_tokens", .value_type = .integer },
-    .{ .env_name = "ZAGENT_TEMPERATURE", .json_key = "temperature", .value_type = .float },
-    .{ .env_name = "ZAGENT_SYSTEM_PROMPT", .json_key = "system_prompt", .value_type = .string },
-    .{ .env_name = "ZAGENT_LOG_LEVEL", .json_key = "log_level", .value_type = .string },
+    .{ .env_name = "ZAICA_PROVIDER", .json_key = "provider", .value_type = .string },
+    .{ .env_name = "ZAICA_MODEL", .json_key = "model", .value_type = .string },
+    .{ .env_name = "ZAICA_MAX_TOKENS", .json_key = "max_tokens", .value_type = .integer },
+    .{ .env_name = "ZAICA_TEMPERATURE", .json_key = "temperature", .value_type = .float },
+    .{ .env_name = "ZAICA_SYSTEM_PROMPT", .json_key = "system_prompt", .value_type = .string },
+    .{ .env_name = "ZAICA_LOG_LEVEL", .json_key = "log_level", .value_type = .string },
 };
 
-/// Build a json.Value object from ZAGENT_* environment variables.
+/// Build a json.Value object from ZAICA_* environment variables.
 /// Returns null if no relevant env vars are set.
 pub fn readEnvOverrides(allocator: std.mem.Allocator) !?json.Value {
     var obj = json.ObjectMap.init(allocator);
@@ -62,7 +62,7 @@ pub fn getEnv(name: []const u8) ?[]const u8 {
 }
 
 test "readEnvOverrides: returns null when no vars set" {
-    // In test env, ZAGENT_* vars are unlikely to be set
+    // In test env, ZAICA_* vars are unlikely to be set
     const allocator = std.testing.allocator;
     const result = try readEnvOverrides(allocator);
     // Can't guarantee no env vars — just check it doesn't crash

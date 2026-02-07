@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Main executable
     const exe = b.addExecutable(.{
-        .name = "zagent",
+        .name = "zc",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run zagent");
+    const run_step = b.step("run", "Run zc");
     run_step.dependOn(&run_cmd.step);
 
     // Tests
