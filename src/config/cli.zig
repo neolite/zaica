@@ -1,4 +1,5 @@
 const std = @import("std");
+const io = @import("../io.zig");
 const types = @import("types.zig");
 
 pub const ParseError = error{
@@ -22,8 +23,8 @@ pub fn parse(allocator: std.mem.Allocator) !types.CliArgs {
 /// Parse arguments from an iterator (testable).
 pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !types.CliArgs {
     var result = types.CliArgs{};
-    var prompt_parts = std.ArrayList([]const u8).init(allocator);
-    defer prompt_parts.deinit();
+    var prompt_parts: std.ArrayList([]const u8) = .empty;
+    defer prompt_parts.deinit(allocator);
 
     while (args_iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "-")) {
@@ -72,13 +73,12 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
             } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 result.show_help = true;
             } else {
-                const stderr = std.io.getStdErr().writer();
-                stderr.print("Unknown flag: {s}\nTry 'zc --help' for more information.\n", .{arg}) catch {};
+                io.printErr("Unknown flag: {s}\nTry 'zc --help' for more information.\n", .{arg});
                 return error.UnknownFlag;
             }
         } else {
             // Positional argument — part of the prompt
-            try prompt_parts.append(arg);
+            try prompt_parts.append(allocator, arg);
         }
     }
 
@@ -91,14 +91,12 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
 }
 
 fn printFlagError(flag: []const u8, msg: []const u8) void {
-    const stderr = std.io.getStdErr().writer();
-    stderr.print("Error: {s} {s}\n", .{ flag, msg }) catch {};
+    io.printErr("Error: {s} {s}\n", .{ flag, msg });
 }
 
 /// Print help text to stdout.
 pub fn printHelp() void {
-    const stdout = std.io.getStdOut().writer();
-    stdout.writeAll(help_text) catch {};
+    io.writeOut(help_text) catch {};
 }
 
 const help_text =

@@ -24,7 +24,15 @@ pub const ToolsConfig = struct {
 pub const Config = struct {
     provider: []const u8 = "glm",
     model: []const u8 = "glm-4.7-flash",
-    system_prompt: []const u8 = "You are a coding assistant.",
+    system_prompt: []const u8 =
+        "You are a coding assistant with access to tools. " ++
+        "Use tools when the user asks to read, write, or search files, run commands, or explore the codebase. " ++
+        "Prefer read_file over execute_bash for reading files. " ++
+        "Prefer list_files over execute_bash for listing directories. " ++
+        "Prefer search_files over execute_bash for searching code. " ++
+        "Do NOT use execute_bash for interactive or long-running commands (editors, servers, REPLs). " ++
+        "Always explain what you're about to do before using tools. " ++
+        "Answer in the same language as the user.",
     max_tokens: u32 = 8192,
     temperature: f64 = 0.0,
     max_context_tokens: u32 = 128000,

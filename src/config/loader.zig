@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const types = @import("types.zig");
 const merge = @import("merge.zig");
+const io = @import("../io.zig");
 const presets = @import("presets.zig");
 const env_mod = @import("env.zig");
 const auth_mod = @import("auth.zig");
@@ -50,8 +51,7 @@ pub fn loadConfig(
 
     // Resolve provider preset
     const provider = presets.findByName(config.value.provider) orelse {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.print("Error: Unknown provider '{s}'. Available: {s}\n", .{
+        io.printErr("Error: Unknown provider '{s}'. Available: {s}\n", .{
             config.value.provider,
             presets.availableNames(),
         });
@@ -93,8 +93,7 @@ fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !?json.Value {
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => {
-            const stderr = std.io.getStdErr().writer();
-            stderr.print("Warning: Could not open config file '{s}': {}\n", .{ path, err }) catch {};
+            io.printErr("Warning: Could not open config file '{s}': {}\n", .{ path, err });
             return null;
         },
     };
@@ -104,8 +103,7 @@ fn readJsonFile(allocator: std.mem.Allocator, path: []const u8) !?json.Value {
     defer allocator.free(content);
 
     const parsed = json.parseFromSlice(json.Value, allocator, content, .{}) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Warning: Invalid JSON in '{s}': {}\n", .{ path, err }) catch {};
+        io.printErr("Warning: Invalid JSON in '{s}': {}\n", .{ path, err });
         return null;
     };
     // Clone to arena so parsed can be freed
@@ -127,8 +125,7 @@ fn readProjectConfig(allocator: std.mem.Allocator) !?json.Value {
     defer allocator.free(content);
 
     const parsed = json.parseFromSlice(json.Value, allocator, content, .{}) catch |err| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Warning: Invalid JSON in '.zaica.json': {}\n", .{err}) catch {};
+        io.printErr("Warning: Invalid JSON in '.zaica.json': {}\n", .{err});
         return null;
     };
     const cloned = try merge.cloneValue(allocator, parsed.value);
@@ -175,11 +172,8 @@ fn cliToJson(allocator: std.mem.Allocator, cli: *const types.CliArgs) !?json.Val
 
 /// Create default config files (--init command).
 pub fn initConfigFiles() !void {
-    const stdout = std.io.getStdOut().writer();
-    const stderr = std.io.getStdErr().writer();
-
     const home = env_mod.getEnv("HOME") orelse {
-        try stderr.writeAll("Error: HOME environment variable not set.\n");
+        io.writeErr("Error: HOME environment variable not set.\n");
         return error.NoHome;
     };
 
@@ -189,14 +183,14 @@ pub fn initConfigFiles() !void {
     std.fs.makeDirAbsolute(std.fs.path.dirname(config_dir).?) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            try stderr.print("Error creating directory: {}\n", .{err});
+            io.printErr("Error creating directory: {}\n", .{err});
             return err;
         },
     };
     std.fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
-            try stderr.print("Error creating directory: {}\n", .{err});
+            io.printErr("Error creating directory: {}\n", .{err});
             return err;
         },
     };
@@ -210,12 +204,12 @@ pub fn initConfigFiles() !void {
             break :blk true;
         };
         if (exists) {
-            try stdout.print("  exists: {s}\n", .{config_path});
+            try io.printOut("  exists: {s}\n", .{config_path});
         } else {
             const file = try std.fs.createFileAbsolute(config_path, .{});
             defer file.close();
             try file.writeAll(default_config_json);
-            try stdout.print("  created: {s}\n", .{config_path});
+            try io.printOut("  created: {s}\n", .{config_path});
         }
     }
 
@@ -228,23 +222,23 @@ pub fn initConfigFiles() !void {
             break :blk true;
         };
         if (exists) {
-            try stdout.print("  exists: {s}\n", .{auth_path});
+            try io.printOut("  exists: {s}\n", .{auth_path});
         } else {
             const file = try std.fs.createFileAbsolute(auth_path, .{});
             defer file.close();
             try file.writeAll(default_auth_json);
             // Set restrictive permissions (chmod 600)
             const f = std.fs.openFileAbsolute(auth_path, .{}) catch {
-                try stdout.print("  created: {s} (could not set permissions)\n", .{auth_path});
+                try io.printOut("  created: {s} (could not set permissions)\n", .{auth_path});
                 return;
             };
             defer f.close();
             f.chmod(0o600) catch {};
-            try stdout.print("  created: {s} (chmod 600)\n", .{auth_path});
+            try io.printOut("  created: {s} (chmod 600)\n", .{auth_path});
         }
     }
 
-    try stdout.writeAll(
+    try io.writeOut(
         \\
         \\Setup complete! Next steps:
         \\  1. Add your API key to ~/.config/zaica/auth.json

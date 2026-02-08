@@ -17,6 +17,7 @@ pub const merge = @import("merge.zig");
 pub const env = @import("env.zig");
 
 const std = @import("std");
+const io = @import("../io.zig");
 
 /// Load the fully resolved configuration.
 /// Handles --help and --init commands (returns error.HelpRequested / error.InitCompleted).
@@ -52,19 +53,16 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
 
     // Validate
     if (validate.validate(&resolved)) |err_msg| {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Config error: {s}\n", .{err_msg}) catch {};
+        io.printErr("Config error: {s}\n", .{err_msg});
         return error.ConfigError;
     }
 
     // Check for missing API key (separate from validate for detailed error)
     if (validate.needsApiKey(&resolved)) {
-        const stderr = std.io.getStdErr().writer();
-        auth.formatKeyError(
-            stderr,
+        auth.printKeyError(
             resolved.config.provider,
             resolved.active_provider.key_env_var,
-        ) catch {};
+        );
         // For --dump-config, allow proceeding without key
         if (!cli_args.dump_config) {
             return error.ConfigError;

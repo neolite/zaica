@@ -4,13 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main executable
-    const exe = b.addExecutable(.{
-        .name = "zc",
-        .root_source_file = b.path("src/main.zig"),
+    // Dependencies
+    const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
     });
+
+    // Main executable
+    const exe = b.addExecutable(.{
+        .name = "zc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     b.installArtifact(exe);
 
     // Run step
@@ -24,10 +33,13 @@ pub fn build(b: *std.Build) void {
 
     // Tests
     const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
+    unit_tests.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);

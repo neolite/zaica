@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const io = @import("../io.zig");
 const types = @import("types.zig");
 const env_mod = @import("env.zig");
 
@@ -70,8 +71,7 @@ fn loadAuthFile(allocator: std.mem.Allocator, provider_name: []const u8) !?[]con
     // Check if group or others have read/write access
     const group_other_mask: u32 = 0o077;
     if (mode & group_other_mask != 0) {
-        const stderr = std.io.getStdErr().writer();
-        stderr.print("Warning: {s} has overly permissive permissions ({o}). Consider: chmod 600 {s}\n", .{ path, mode & 0o777, path }) catch {};
+        io.printErr("Warning: {s} has overly permissive permissions ({o}). Consider: chmod 600 {s}\n", .{ path, mode & 0o777, path });
     }
 
     // Read and parse
@@ -110,17 +110,17 @@ pub fn getConfigDir(allocator: std.mem.Allocator) !?[]const u8 {
     return try std.fmt.allocPrint(allocator, "{s}/.config/zaica", .{home});
 }
 
-/// Format a helpful error message when no API key is found.
-pub fn formatKeyError(writer: anytype, provider_name: []const u8, provider_key_env: ?[]const u8) !void {
-    try writer.print("Error: No API key found for provider '{s}'.\n\n", .{provider_name});
-    try writer.writeAll("Set it using one of these methods (highest priority first):\n");
-    try writer.writeAll("  1. CLI flag:     zc --api-key <key> ...\n");
-    try writer.writeAll("  2. Env var:      export ZAICA_API_KEY=<key>\n");
+/// Print a helpful error message when no API key is found.
+pub fn printKeyError(provider_name: []const u8, provider_key_env: ?[]const u8) void {
+    io.printErr("Error: No API key found for provider '{s}'.\n\n", .{provider_name});
+    io.writeErr("Set it using one of these methods (highest priority first):\n");
+    io.writeErr("  1. CLI flag:     zc --api-key <key> ...\n");
+    io.writeErr("  2. Env var:      export ZAICA_API_KEY=<key>\n");
     if (provider_key_env) |env_name| {
-        try writer.print("  3. Provider env: export {s}=<key>\n", .{env_name});
+        io.printErr("  3. Provider env: export {s}=<key>\n", .{env_name});
     }
-    try writer.writeAll("  4. Auth file:    ~/.config/zaica/auth.json\n\n");
-    try writer.writeAll("To create a default auth file, run: zc --init\n");
+    io.writeErr("  4. Auth file:    ~/.config/zaica/auth.json\n\n");
+    io.writeErr("To create a default auth file, run: zc --init\n");
 }
 
 test "resolveApiKey: returns none when nothing set" {
