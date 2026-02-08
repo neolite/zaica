@@ -7,5 +7,9 @@ zig-out/
 .env
 auth.json
 
+# Test artifacts
+test_child*
+info.md
+
 # OS
 .DS_Store
