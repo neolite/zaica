@@ -162,6 +162,7 @@ pub fn streamChatCompletion(
     // Detect this: if first line starts with '{', it's not SSE.
     var first_line = true;
     var in_reasoning = false;
+    var first_content = true;
     var final_usage: ?sse.TokenUsage = null;
 
     while (try line_reader.nextLine(&line_buf)) |line| {
@@ -183,7 +184,7 @@ pub fn streamChatCompletion(
                 defer allocator.free(text);
                 io.stopSpinner();
                 if (!in_reasoning) {
-                    io.writeOut("\x1b[2;3m<thinking>\x1b[0m\r\n\x1b[2m") catch {};
+                    io.writeOut("\x1b[95m\xe2\x9c\xa7 Thinking...\x1b[0m\r\n\x1b[2m") catch {};
                     in_reasoning = true;
                 }
                 io.writeText(text) catch {};
@@ -192,8 +193,12 @@ pub fn streamChatCompletion(
                 defer allocator.free(content);
                 io.stopSpinner();
                 if (in_reasoning) {
-                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n\r\n") catch {};
+                    io.writeOut("\x1b[0m\r\n\r\n") catch {};
                     in_reasoning = false;
+                }
+                if (first_content) {
+                    io.writeOut("\r\n\x1b[95m\xe2\x97\x87\x1b[0m ") catch {}; // magenta ◇
+                    first_content = false;
                 }
                 on_content(content);
                 try response_buf.appendSlice(allocator, content);
@@ -202,7 +207,7 @@ pub fn streamChatCompletion(
                 defer sse.freeToolCallDelta(allocator, delta);
                 io.stopSpinner();
                 if (in_reasoning) {
-                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n\r\n") catch {};
+                    io.writeOut("\x1b[0m\r\n\r\n") catch {};
                     in_reasoning = false;
                 }
 
@@ -212,10 +217,11 @@ pub fn streamChatCompletion(
                     if (delta.id) |id| try acc.id.appendSlice(allocator, id);
                     if (delta.function_name) |name| {
                         try acc.name.appendSlice(allocator, name);
-                        // Show tool call name as it arrives (dim)
-                        io.writeOut("\x1b[2m[tool: ") catch {};
-                        io.writeOut(name) catch {};
-                        io.writeOut("]\x1b[0m\r\n") catch {};
+                        // Show tool call name as it arrives (CC-style bold)
+                        io.writeOut("\x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
+                        io.writeOut("\x1b[1m") catch {};
+                        io.writeOut(ccToolName(name)) catch {};
+                        io.writeOut("\x1b[0m\r\n") catch {};
                     }
                     if (delta.function_arguments) |args| try acc.arguments.appendSlice(allocator, args);
                     try tc_accumulators.append(allocator, acc);
@@ -230,7 +236,7 @@ pub fn streamChatCompletion(
             .done => |usage| {
                 if (usage) |u| final_usage = u;
                 if (in_reasoning) {
-                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n") catch {};
+                    io.writeOut("\x1b[0m\r\n") catch {};
                 }
                 break;
             },
@@ -272,6 +278,16 @@ pub fn streamChatCompletion(
     }
 
     return .{ .response = .{ .text = try response_buf.toOwnedSlice(allocator) }, .usage = final_usage };
+}
+
+/// Map internal tool names to CC-style display names (local to http.zig).
+fn ccToolName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "execute_bash")) return "Bash";
+    if (std.mem.eql(u8, name, "read_file")) return "Read";
+    if (std.mem.eql(u8, name, "write_file")) return "Write";
+    if (std.mem.eql(u8, name, "list_files")) return "List";
+    if (std.mem.eql(u8, name, "search_files")) return "Search";
+    return name;
 }
 
 /// Try to extract error.message from a JSON error response.

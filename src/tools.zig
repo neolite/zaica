@@ -32,6 +32,16 @@ pub fn isAllowed(name: []const u8, level: PermissionLevel) bool {
     };
 }
 
+/// Map internal tool names to CC-style display names.
+pub fn displayToolName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "execute_bash")) return "Bash";
+    if (std.mem.eql(u8, name, "read_file")) return "Read";
+    if (std.mem.eql(u8, name, "write_file")) return "Write";
+    if (std.mem.eql(u8, name, "list_files")) return "List";
+    if (std.mem.eql(u8, name, "search_files")) return "Search";
+    return name;
+}
+
 /// Print a formatted list of available tools to stdout.
 pub fn printToolList() void {
     io.writeText("\n") catch {};
@@ -45,15 +55,16 @@ pub fn printToolList() void {
             .dangerous => "\x1b[31m", // red
         };
         const badge = switch (risk) {
-            .safe => "[safe]",
-            .write => "[write]",
-            .dangerous => "[dangerous]",
+            .safe => "safe",
+            .write => "write",
+            .dangerous => "dangerous",
         };
         io.writeOut("  ") catch {};
         io.writeOut(color) catch {};
-        io.writeOut(tool.function.name) catch {};
+        io.writeOut("\xe2\x9c\xa6 ") catch {}; // ✦
+        io.writeOut(displayToolName(tool.function.name)) catch {};
         io.writeOut("\x1b[0m ") catch {};
-        io.writeOut(color) catch {};
+        io.writeOut("\x1b[2m") catch {};
         io.writeOut(badge) catch {};
         io.writeOut("\x1b[0m\r\n") catch {};
         io.writeOut("    ") catch {};

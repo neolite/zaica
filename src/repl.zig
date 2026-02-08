@@ -11,6 +11,7 @@ const tools = @import("tools.zig");
 const InputKey = union(enum) {
     char: []const u8,
     enter,
+    tab,
     backspace,
     delete,
     left,
@@ -178,6 +179,7 @@ pub const Repl = struct {
             0x03 => .ctrl_c,
             0x04 => .ctrl_d,
             0x05 => .ctrl_e,
+            0x09 => .tab,
             0x0B => .ctrl_k,
             0x0C => .ctrl_l,
             0x0D => .enter,
@@ -287,18 +289,18 @@ pub const Repl = struct {
 
     // ── Line rendering ────────────────────────────────────────────────
 
-    /// Render the current line with prompt, clearing and repositioning cursor.
+    /// Render the current line on the fixed input row (rows-2).
     fn renderLine(self: *Repl) void {
-        const prompt = "> ";
-        const cursor_display = prompt.len + displayWidth(self.buf.items[0..self.cursor]);
-        io.writeOut("\r\x1b[K") catch {};
-        io.writeOut(prompt) catch {};
+        const term = io.getTerminalSize();
+        const input_row = term.rows - 2;
+        const prompt = " \xc2\xbb "; // ·»· (left-padded)
+        const prompt_display_width: usize = 3; // " » " = 3 columns
+        const cursor_display = prompt_display_width + displayWidth(self.buf.items[0..self.cursor]);
+        const cursor_col = cursor_display + 1; // 1-based
+        io.printOut("\x1b[{d};1H\x1b[K", .{input_row}) catch {};
+        io.writeOut("\x1b[95m" ++ prompt ++ "\x1b[0m") catch {};
         io.writeOut(self.buf.items) catch {};
-        if (cursor_display == 0) {
-            io.writeOut("\r") catch {};
-        } else {
-            io.printOut("\r\x1b[{d}C", .{cursor_display}) catch {};
-        }
+        io.printOut("\x1b[{d};{d}H", .{ input_row, cursor_col }) catch {};
     }
 
     // ── Editing operations ────────────────────────────────────────────
@@ -340,6 +342,49 @@ pub const Repl = struct {
             self.removeBytes(pos, self.cursor - pos);
             self.cursor = pos;
         }
+    }
+
+    // ── Tab completion ─────────────────────────────────────────────────
+
+    /// Available slash commands for tab completion.
+    const slash_commands = [_][]const u8{ "/exit", "/help", "/quit", "/tools", "/usage" };
+
+    /// Attempt to complete a slash command from the current buffer prefix.
+    /// If exactly one command matches, replaces buffer with it.
+    /// If multiple match, completes to their longest common prefix.
+    fn tryCompleteCommand(self: *Repl) void {
+        const input = self.buf.items;
+        if (input.len == 0 or input[0] != '/') return;
+
+        // Find all commands that start with the current input
+        var matches: [slash_commands.len]usize = undefined;
+        var match_count: usize = 0;
+        for (slash_commands, 0..) |cmd, i| {
+            if (cmd.len >= input.len and std.mem.eql(u8, cmd[0..input.len], input)) {
+                matches[match_count] = i;
+                match_count += 1;
+            }
+        }
+
+        if (match_count == 0) return;
+
+        // Find longest common prefix among matches
+        const first = slash_commands[matches[0]];
+        var common_len: usize = first.len;
+        for (matches[1..match_count]) |mi| {
+            const other = slash_commands[mi];
+            const limit = @min(common_len, other.len);
+            var j: usize = 0;
+            while (j < limit and first[j] == other[j]) : (j += 1) {}
+            common_len = j;
+        }
+
+        if (common_len <= input.len) return; // nothing new to complete
+
+        // Replace buffer with the common prefix
+        self.buf.clearRetainingCapacity();
+        self.buf.appendSlice(self.allocator, first[0..common_len]) catch return;
+        self.cursor = self.buf.items.len;
     }
 
     // ── History ───────────────────────────────────────────────────────
@@ -402,7 +447,6 @@ pub const Repl = struct {
 
             switch (key) {
                 .enter => {
-                    io.writeOut("\r\n") catch {};
                     const line = try self.allocator.dupe(u8, self.buf.items);
                     // Deduplicate: skip if same as last history entry
                     if (line.len > 0) {
@@ -414,21 +458,14 @@ pub const Repl = struct {
                     }
                     return line;
                 },
-                .eof => {
-                    io.writeOut("\r\n") catch {};
-                    return null;
-                },
+                .eof => return null,
                 .ctrl_d => {
-                    if (self.buf.items.len == 0) {
-                        io.writeOut("\r\n") catch {};
-                        return null;
-                    }
+                    if (self.buf.items.len == 0) return null;
                     self.deleteCharAtCursor();
                 },
                 .ctrl_c => {
                     self.buf.clearRetainingCapacity();
                     self.cursor = 0;
-                    io.writeOut("^C\r\n") catch {};
                 },
                 .ctrl_a, .home => self.cursor = 0,
                 .ctrl_e, .end => self.cursor = self.buf.items.len,
@@ -441,8 +478,16 @@ pub const Repl = struct {
                         self.cursor = 0;
                     }
                 },
+                .tab => self.tryCompleteCommand(),
                 .ctrl_w => self.deleteWordBackward(),
-                .ctrl_l => io.writeOut("\x1b[2J\x1b[H") catch {},
+                .ctrl_l => {
+                    // Clear screen and re-setup full layout
+                    const ts = io.getTerminalSize();
+                    io.writeOut("\x1b[2J\x1b[H") catch {};
+                    io.setupScrollRegion(ts.rows);
+                    io.renderSeparator(ts.rows - 3, ts.cols);
+                    io.renderSeparator(ts.rows - 1, ts.cols);
+                },
                 .left => self.cursorLeft(),
                 .right => self.cursorRight(),
                 .up => try self.historyPrev(),
@@ -589,7 +634,169 @@ fn isExitCommand(input: []const u8) bool {
 }
 
 /// Visual separator between input and output.
-const SEPARATOR = "\x1b[2m────────────────────────────────────────\x1b[0m";
+const SEPARATOR = "";
+
+// ── Status Bar ────────────────────────────────────────────────────────
+
+/// Persistent status bar rendered on the last terminal row.
+/// Displays: [spinner+phase] │ model │ tokens/limit (N%) │ permission │ elapsed
+const StatusBar = struct {
+    model_name: []const u8,
+    tokens_used: u64,
+    context_limit: u32,
+    permission: tools.PermissionLevel,
+    start_time: i64,
+    rows: u16,
+    cols: u16,
+
+    /// Format the static portion of the status bar (everything except spinner).
+    /// Returns the number of bytes written into `buf`.
+    fn formatStatic(self: *const StatusBar, buf: []u8) usize {
+        var pos: usize = 0;
+
+        // Model name
+        const model = self.model_name;
+        const model_len = @min(model.len, 24); // truncate long model names
+        if (pos + model_len < buf.len) {
+            @memcpy(buf[pos..][0..model_len], model[0..model_len]);
+            pos += model_len;
+        }
+
+        // Separator " │ "
+        const sep = " \xe2\x94\x82 "; // " │ " UTF-8
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
+
+        // Tokens: "1.2k/128k (1%)"
+        pos += formatTokens(buf[pos..], self.tokens_used, self.context_limit);
+
+        // Separator
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
+
+        // Permission level
+        const perm_str = switch (self.permission) {
+            .all => "all",
+            .safe_only => "safe",
+            .none => "ask",
+        };
+        if (pos + perm_str.len < buf.len) {
+            @memcpy(buf[pos..][0..perm_str.len], perm_str);
+            pos += perm_str.len;
+        }
+
+        // Separator
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
+
+        // Elapsed time "H:MM:SS"
+        pos += formatElapsed(buf[pos..], self.start_time);
+
+        // Trailing space
+        if (pos < buf.len) {
+            buf[pos] = ' ';
+            pos += 1;
+        }
+
+        return pos;
+    }
+
+    /// Render the status bar in idle mode (no spinner).
+    fn render(self: *StatusBar) void {
+        var buf: [512]u8 = undefined;
+        buf[0] = ' ';
+        const len = self.formatStatic(buf[1..]);
+        io.renderStatusBar(self.rows, buf[0 .. len + 1]);
+    }
+
+    /// Update the static content visible to the spinner thread, then re-render.
+    /// Skips direct render when spinner is active (spinner handles its own renders).
+    fn syncAndRender(self: *StatusBar) void {
+        var buf: [512]u8 = undefined;
+        const len = self.formatStatic(&buf);
+        io.setStatusStatic(buf[0..len]);
+        io.setStatusRows(self.rows);
+        // Only render directly if no spinner is running — otherwise the spinner
+        // thread handles rendering and concurrent \x1b7/\x1b8 would corrupt
+        // the saved cursor position.
+        if (!io.isSpinnerActive()) {
+            self.render();
+        }
+    }
+
+    fn updateTokens(self: *StatusBar, used: u64) void {
+        self.tokens_used = used;
+        self.syncAndRender();
+    }
+
+    fn setPermission(self: *StatusBar, perm: tools.PermissionLevel) void {
+        self.permission = perm;
+        self.syncAndRender();
+    }
+
+    fn resize(self: *StatusBar) void {
+        const term = io.getTerminalSize();
+        self.rows = term.rows;
+        self.cols = term.cols;
+        io.setupScrollRegion(self.rows);
+        io.renderSeparator(self.rows - 3, self.cols); // top separator
+        io.renderSeparator(self.rows - 1, self.cols); // bottom separator
+        io.printOut("\x1b[{d};1H", .{self.rows - 4}) catch {}; // cursor back to scroll region
+        self.syncAndRender();
+    }
+
+    // ── Formatting helpers ────────────────────────────────────────
+
+    /// Format token count with K suffix: 0 → "0", 1234 → "1.2k", 128000 → "128k".
+    fn formatK(buf: []u8, value: u64) usize {
+        if (value == 0) {
+            buf[0] = '0';
+            return 1;
+        }
+        if (value < 1000) {
+            return (std.fmt.bufPrint(buf, "{d}", .{value}) catch return 0).len;
+        }
+        if (value < 10000) {
+            // 1.2k format
+            const whole = value / 1000;
+            const frac = (value % 1000) / 100;
+            return (std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, frac }) catch return 0).len;
+        }
+        // 12k, 128k format
+        return (std.fmt.bufPrint(buf, "{d}k", .{value / 1000}) catch return 0).len;
+    }
+
+    /// Format "used/limit (N%)" token display.
+    fn formatTokens(buf: []u8, used: u64, limit: u32) usize {
+        var pos: usize = 0;
+        pos += formatK(buf[pos..], used);
+        buf[pos] = '/';
+        pos += 1;
+        pos += formatK(buf[pos..], @as(u64, limit));
+
+        const pct: u64 = if (limit > 0) (used * 100) / @as(u64, limit) else 0;
+        const pct_str = std.fmt.bufPrint(buf[pos..], " ({d}%)", .{pct}) catch return pos;
+        pos += pct_str.len;
+        return pos;
+    }
+
+    /// Format elapsed time as "H:MM:SS" from a start timestamp.
+    fn formatElapsed(buf: []u8, start_time: i64) usize {
+        const now = std.time.timestamp();
+        const elapsed: u64 = if (now > start_time) @intCast(now - start_time) else 0;
+        const hours = elapsed / 3600;
+        const mins = (elapsed % 3600) / 60;
+        const secs = elapsed % 60;
+        const result = std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ hours, mins, secs }) catch return 0;
+        return result.len;
+    }
+};
 
 fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
@@ -607,17 +814,63 @@ fn printHelp() void {
 /// Maximum number of agent iterations per user message.
 const MAX_AGENT_ITERATIONS = 25;
 
+/// Atomic flag for SIGWINCH (terminal resize).
+var sigwinch_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// SIGWINCH signal handler — just sets the atomic flag.
+fn sigwinchHandler(_: c_int) callconv(.c) void {
+    sigwinch_received.store(true, .release);
+}
+
 /// Main REPL entry point — called from main.zig.
 pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig) !void {
-    io.printText("zaica v0.1 — {s}/{s}\n", .{
+    // Switch to alternate screen buffer — clean slate, original content restored on exit.
+    // This is what vim, less, htop do. Must happen before any zone setup.
+    io.writeOut("\x1b[?1049h") catch {};
+
+    // Set up terminal zones FIRST: scroll region + separator + input + status bar.
+    // CSI r (DECSTBM) resets cursor to home (1,1) per VT100 spec, so we must
+    // set up zones before printing anything — no save/restore across CSI r.
+    const term = io.getTerminalSize();
+    io.setupScrollRegion(term.rows);
+    io.renderSeparator(term.rows - 3, term.cols); // top separator (above input)
+    io.renderSeparator(term.rows - 1, term.cols); // bottom separator (below input)
+    // Position cursor at bottom of scroll region — content grows upward like a real terminal
+    io.printOut("\x1b[{d};1H", .{term.rows - 4}) catch {};
+
+    // Print banner — scrolls up naturally from the bottom
+    io.printText("\x1b[1mzaica\x1b[0m v0.2 \xc2\xb7 {s}/{s}\n", .{
         resolved.config.provider,
         resolved.resolved_model,
     }) catch {};
-    io.writeText("Type /help for commands, /exit to quit.\n\n") catch {};
+    io.writeText("\x1b[2mType /help for commands, /exit to quit.\x1b[0m\n\n") catch {};
+
+    var status = StatusBar{
+        .model_name = resolved.resolved_model,
+        .tokens_used = 0,
+        .context_limit = resolved.config.max_context_tokens,
+        .permission = .none,
+        .start_time = std.time.timestamp(),
+        .rows = term.rows,
+        .cols = term.cols,
+    };
+    status.syncAndRender();
+
+    // Install SIGWINCH handler for terminal resize
+    const sa = posix.Sigaction{
+        .handler = .{ .handler = sigwinchHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.WINCH, &sa, null);
 
     var repl = try Repl.init(allocator);
     repl.loadHistory();
     defer {
+        // Restore terminal state: reset scroll region, ensure cursor visible, restore main screen
+        io.resetScrollRegion();
+        io.writeOut("\x1b[?25h") catch {}; // ensure cursor visible before leaving
+        io.writeOut("\x1b[?1049l") catch {}; // restore main screen buffer
         repl.saveHistory();
         repl.deinit();
     }
@@ -644,12 +897,33 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     var session_completion_tokens: u64 = 0;
 
     while (true) {
+        // Check for terminal resize
+        if (sigwinch_received.swap(false, .acquire)) {
+            status.resize();
+        }
+
+        // Show cursor (entering input mode) + save scroll region cursor
+        io.writeOut("\x1b[?25h") catch {};
+        io.writeOut("\x1b7") catch {};
         const maybe_line = try repl.readLine();
+        // Clear input line and restore scroll region cursor
+        {
+            const ts = io.getTerminalSize();
+            io.printOut("\x1b[{d};1H\x1b[K", .{ts.rows - 2}) catch {};
+        }
+        io.writeOut("\x1b8") catch {};
+        io.writeOut("\x1b[?25l") catch {}; // hide cursor (leaving input mode)
+
         const line = maybe_line orelse break;
         defer allocator.free(line);
 
         const trimmed = std.mem.trimRight(u8, line, "\r ");
         if (trimmed.len == 0) continue;
+
+        // Echo user input into scroll region
+        io.writeOut("\x1b[95m\xc2\xbb \x1b[0m") catch {};
+        io.writeText(trimmed) catch {};
+        io.writeOut("\r\n") catch {};
 
         if (isExitCommand(trimmed)) break;
         if (std.mem.eql(u8, trimmed, "/tools")) {
@@ -674,12 +948,13 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         try history.append(allocator, .{ .text = .{ .role = .user, .content = user_content } });
 
         // Visual separator between input and output
-        io.writeOut(SEPARATOR ++ "\r\n") catch {};
+        io.writeOut("\r\n") catch {};
 
         // Agentic loop: keep calling LLM until we get a text response
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Terminal is in cooked mode here — streaming works normally
+            status.syncAndRender();
             io.startSpinner("Thinking...");
             const result = client.chatMessages(
                 allocator,
@@ -687,6 +962,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 history.items,
                 tools.all_tools,
             ) catch {
+                io.stopSpinner();
                 if (iterations == 0) {
                     // First call failed — remove user message
                     if (history.pop()) |removed| {
@@ -700,12 +976,8 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             if (result.usage) |usage| {
                 session_prompt_tokens += usage.prompt_tokens;
                 session_completion_tokens += usage.completion_tokens;
-                io.printOut("\x1b[2m[tokens: {d} prompt + {d} completion = {d} | session: {d}]\x1b[0m\r\n", .{
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    session_prompt_tokens + session_completion_tokens,
-                }) catch {};
+                // Update status bar with cumulative token count
+                status.updateTokens(session_prompt_tokens + session_completion_tokens);
 
                 // Context window warnings and compaction
                 const max_ctx = resolved.config.max_context_tokens;
@@ -745,7 +1017,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 .tool_calls => |tcs| {
                     // Ask permission on first tool use in session
                     if (permission_level == .none) {
-                        io.writeOut("\r\n\x1b[1;33mThe assistant wants to use tools:\x1b[0m\r\n") catch {};
+                        io.writeOut("\r\n") catch {};
                         for (tcs) |tc| {
                             const risk = tools.toolRisk(tc.function.name);
                             const color: []const u8 = switch (risk) {
@@ -755,11 +1027,18 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                             };
                             io.writeOut("  ") catch {};
                             io.writeOut(color) catch {};
-                            io.printOut("{s}\x1b[0m({s})\r\n", .{ tc.function.name, truncateArgs(tc.function.arguments) }) catch {};
+                            io.writeOut("\xe2\x9c\xa6 ") catch {}; // ✦
+                            if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
+                                defer allocator.free(key_arg);
+                                io.printOut("{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc.function.name), key_arg }) catch {};
+                            } else {
+                                io.printOut("{s}\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
+                            }
                         }
-                        io.writeOut("\x1b[1;33mAllow? [y]es all / [s]afe only / [n]o\x1b[0m ") catch {};
+                        io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
 
                         permission_level = repl.readPermission() catch .none;
+                        status.setPermission(permission_level);
                         if (permission_level == .none) {
                             // Deny all tools
                             try history.append(allocator, .{
@@ -798,31 +1077,38 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     // First pass: check permissions, print status, fill denied results
                     for (tcs, 0..) |tc, i| {
                         if (!tools.isAllowed(tc.function.name, permission_level)) {
-                            io.printOut("\x1b[33m  x {s} (not allowed)\x1b[0m\r\n", .{tc.function.name}) catch {};
+                            io.printOut("\x1b[31m  \xe2\x8a\x98 {s} (not allowed)\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
                             tool_results[i] = .{
                                 .tool_call_id = try allocator.dupe(u8, tc.id),
                                 .content = std.fmt.allocPrint(allocator, "Permission denied: {s} requires full tool access (safe-only mode active).", .{tc.function.name}) catch try allocator.dupe(u8, "Permission denied."),
                             };
                         } else {
-                            // Show tool name + key arg
-                            if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
-                                defer allocator.free(key_arg);
-                                io.printOut("\x1b[2m  → {s} \x1b[2;3m{s}\x1b[0m\r\n", .{ tc.function.name, key_arg }) catch {};
-                            } else {
-                                io.printOut("\x1b[2m  → {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
-                            }
                             thread_indices[thread_count] = i;
                             thread_count += 1;
                         }
                     }
 
+                    // Display allowed tools with ✦ prefix
+                    if (thread_count > 0) {
+                        for (thread_indices[0..thread_count]) |idx| {
+                            const tc_disp = tcs[idx];
+                            io.writeOut("  \x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
+                            if (extractKeyArg(allocator, tc_disp.function.name, tc_disp.function.arguments)) |key_arg| {
+                                defer allocator.free(key_arg);
+                                io.printOut("\x1b[1m{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc_disp.function.name), key_arg }) catch {};
+                            } else {
+                                io.printOut("\x1b[1m{s}\x1b[0m\r\n", .{tools.displayToolName(tc_disp.function.name)}) catch {};
+                            }
+                        }
+                    }
+
                     // Execute allowed tools in background threads with spinner
                     if (thread_count > 0) {
-                        // Build label from tool names: "read_file, execute_bash"
+                        // Build label from display names: "Read, Bash"
                         var label_buf: [256]u8 = undefined;
                         var label_pos: usize = 0;
                         for (thread_indices[0..thread_count]) |idx| {
-                            const name = tcs[idx].function.name;
+                            const name = tools.displayToolName(tcs[idx].function.name);
                             if (label_pos > 0) {
                                 if (label_pos + 2 <= label_buf.len) {
                                     @memcpy(label_buf[label_pos..][0..2], ", ");
@@ -835,6 +1121,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 label_pos += copy_len;
                             }
                         }
+                        status.syncAndRender();
                         io.startSpinner(label_buf[0..label_pos]);
 
                         const threads = try allocator.alloc(?std.Thread, thread_count);
@@ -861,25 +1148,19 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         io.stopSpinner();
                     }
 
-                    // Print tool results so the user can see what happened
-                    for (tcs, 0..) |tc, i| {
+                    // Print tool results with ⎿ prefix
+                    for (0..tcs.len) |i| {
                         const content = tool_results[i].content;
                         if (content.len == 0) continue;
-                        // Tool name header with key arg
-                        if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
-                            defer allocator.free(key_arg);
-                            io.printOut("\x1b[2m  ┌ {s} \x1b[2;3m{s}\x1b[0m\r\n", .{ tc.function.name, key_arg }) catch {};
-                        } else {
-                            io.printOut("\x1b[2m  ┌ {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
-                        }
                         // Truncate long output
                         const max_preview = 1024;
                         const preview = if (content.len > max_preview) content[0..max_preview] else content;
                         const color: []const u8 = if (isErrorOutput(content)) "\x1b[31m" else "\x1b[2m";
+                        io.writeOut("    \x1b[2m\xe2\x97\x87\x1b[0m ") catch {}; // dim ◇
                         io.writeOut(color) catch {};
                         io.writeText(preview) catch {};
                         if (content.len > max_preview) {
-                            io.printOut("\r\n  ... ({d} bytes total)", .{content.len}) catch {};
+                            io.printOut("\r\n     ... ({d} bytes total)", .{content.len}) catch {};
                         }
                         io.writeOut("\x1b[0m\r\n") catch {};
                     }
@@ -1022,4 +1303,39 @@ test "isErrorOutput: detects errors" {
     try std.testing.expect(isErrorOutput("Permission denied: read_file"));
     try std.testing.expect(!isErrorOutput("file contents here"));
     try std.testing.expect(!isErrorOutput(""));
+}
+
+test "slash_commands: unique match completes fully" {
+    // "/he" → "/help" (only match)
+    const commands = Repl.slash_commands;
+    var match_count: usize = 0;
+    const prefix = "/he";
+    for (commands) |cmd| {
+        if (cmd.len >= prefix.len and std.mem.eql(u8, cmd[0..prefix.len], prefix))
+            match_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), match_count);
+}
+
+test "slash_commands: ambiguous prefix finds common prefix" {
+    // "/e" matches "/exit" only
+    const commands = Repl.slash_commands;
+    var match_count: usize = 0;
+    const prefix = "/e";
+    for (commands) |cmd| {
+        if (cmd.len >= prefix.len and std.mem.eql(u8, cmd[0..prefix.len], prefix))
+            match_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), match_count);
+}
+
+test "slash_commands: no match for unknown prefix" {
+    const commands = Repl.slash_commands;
+    var match_count: usize = 0;
+    const prefix = "/z";
+    for (commands) |cmd| {
+        if (cmd.len >= prefix.len and std.mem.eql(u8, cmd[0..prefix.len], prefix))
+            match_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), match_count);
 }
