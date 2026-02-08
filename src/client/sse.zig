@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// Token usage statistics from the API response.
+pub const TokenUsage = struct {
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    total_tokens: u32 = 0,
+};
+
 /// A single delta fragment for a tool call being streamed.
 pub const ToolCallDelta = struct {
     index: usize,
@@ -16,8 +23,8 @@ pub const SseEvent = union(enum) {
     reasoning: []const u8,
     /// A streamed fragment of a tool call.
     tool_call_delta: ToolCallDelta,
-    /// Stream finished normally.
-    done: void,
+    /// Stream finished normally. Carries optional token usage data.
+    done: ?TokenUsage,
     /// A line we don't handle (e.g. empty, comment, non-data).
     skip: void,
     /// Error response from the API.
@@ -36,7 +43,7 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseEvent {
     const payload = line[prefix.len..];
 
     // Check for stream termination
-    if (std.mem.eql(u8, payload, "[DONE]")) return .done;
+    if (std.mem.eql(u8, payload, "[DONE]")) return .{ .done = null };
 
     // Parse JSON to extract content delta
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
@@ -79,7 +86,7 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseEvent {
                         return .{ .content = try allocator.dupe(u8, content.string) };
                     }
                 }
-                return .done;
+                return .{ .done = parseUsage(parsed.value.object) };
             }
         }
     }
@@ -109,6 +116,27 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseEvent {
     }
 
     return .skip;
+}
+
+/// Extract usage data from a top-level SSE JSON object.
+fn parseUsage(obj: std.json.ObjectMap) ?TokenUsage {
+    const usage = obj.get("usage") orelse return null;
+    if (usage != .object) return null;
+    var result = TokenUsage{};
+    if (usage.object.get("prompt_tokens")) |v| {
+        if (v == .integer) result.prompt_tokens = @intCast(v.integer);
+    }
+    if (usage.object.get("completion_tokens")) |v| {
+        if (v == .integer) result.completion_tokens = @intCast(v.integer);
+    }
+    if (usage.object.get("total_tokens")) |v| {
+        if (v == .integer) result.total_tokens = @intCast(v.integer);
+    }
+    // Only return if we got at least one non-zero value
+    if (result.prompt_tokens > 0 or result.completion_tokens > 0 or result.total_tokens > 0) {
+        return result;
+    }
+    return null;
 }
 
 /// Parse a single tool_calls[] element from the delta.
@@ -295,4 +323,28 @@ test "IoLineReader: splits lines correctly" {
     try std.testing.expectEqualStrings("line3", l3);
 
     try std.testing.expect(try lr.nextLine(&buf) == null);
+}
+
+test "parseSseLine: finish_reason with usage data" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":150,\"completion_tokens\":80,\"total_tokens\":230}}";
+    const event = try parseSseLine(allocator, line);
+    switch (event) {
+        .done => |usage| {
+            try std.testing.expect(usage != null);
+            try std.testing.expectEqual(@as(u32, 150), usage.?.prompt_tokens);
+            try std.testing.expectEqual(@as(u32, 80), usage.?.completion_tokens);
+            try std.testing.expectEqual(@as(u32, 230), usage.?.total_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseSseLine: DONE returns null usage" {
+    const allocator = std.testing.allocator;
+    const event = try parseSseLine(allocator, "data: [DONE]");
+    switch (event) {
+        .done => |usage| try std.testing.expect(usage == null),
+        else => return error.TestUnexpectedResult,
+    }
 }

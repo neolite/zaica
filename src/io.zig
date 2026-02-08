@@ -56,11 +56,19 @@ pub fn printText(comptime fmt: []const u8, args: anytype) !void {
 var spinner_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 /// Handle to the background spinner thread (null when not running).
 var spinner_thread: ?std.Thread = null;
+/// Fixed buffer for spinner label (thread-safe via atomic length).
+var spinner_label: [256]u8 = undefined;
+/// Atomic length of the current spinner label. Write with .release, read with .acquire
+/// to form a release-acquire pair guaranteeing label buffer visibility.
+var spinner_label_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-/// Start animated spinner in a background thread.
+/// Start animated spinner in a background thread with a context label.
 /// The spinner cycles through braille frames at 80ms intervals.
 /// Call stopSpinner() to halt and clear the spinner line.
-pub fn startSpinner() void {
+pub fn startSpinner(label: []const u8) void {
+    const len = @min(label.len, spinner_label.len);
+    @memcpy(spinner_label[0..len], label[0..len]);
+    spinner_label_len.store(len, .release);
     spinner_stop.store(false, .release);
     spinner_thread = std.Thread.spawn(.{}, spinnerLoop, .{}) catch null;
 }
@@ -80,9 +88,14 @@ fn spinnerLoop() void {
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     var i: usize = 0;
     while (!spinner_stop.load(.acquire)) {
-        writeOut("\r\x1b[2m") catch {};
+        const len = spinner_label_len.load(.acquire);
+        writeOut("\r\x1b[K\x1b[2m") catch {};
         writeOut(frames[i % frames.len]) catch {};
-        writeOut(" \x1b[0m") catch {};
+        writeOut(" ") catch {};
+        if (len > 0) {
+            writeOut(spinner_label[0..len]) catch {};
+        }
+        writeOut("\x1b[0m") catch {};
         std.Thread.sleep(80_000_000); // 80ms
         i +%= 1;
     }

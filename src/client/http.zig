@@ -12,9 +12,14 @@ pub const StreamError = error{
 };
 
 /// Result of a streaming chat completion.
-pub const CompletionResult = union(enum) {
-    text: []const u8,
-    tool_calls: []const message.ToolCall,
+pub const CompletionResult = struct {
+    response: ResponseKind,
+    usage: ?sse.TokenUsage = null,
+
+    pub const ResponseKind = union(enum) {
+        text: []const u8,
+        tool_calls: []const message.ToolCall,
+    };
 };
 
 /// In-progress tool call being accumulated from deltas.
@@ -157,6 +162,7 @@ pub fn streamChatCompletion(
     // Detect this: if first line starts with '{', it's not SSE.
     var first_line = true;
     var in_reasoning = false;
+    var final_usage: ?sse.TokenUsage = null;
 
     while (try line_reader.nextLine(&line_buf)) |line| {
         if (first_line and line.len > 0 and line[0] == '{') {
@@ -177,7 +183,7 @@ pub fn streamChatCompletion(
                 defer allocator.free(text);
                 io.stopSpinner();
                 if (!in_reasoning) {
-                    io.writeOut("\x1b[2m") catch {}; // dim on
+                    io.writeOut("\x1b[2;3m<thinking>\x1b[0m\r\n\x1b[2m") catch {};
                     in_reasoning = true;
                 }
                 io.writeText(text) catch {};
@@ -186,7 +192,7 @@ pub fn streamChatCompletion(
                 defer allocator.free(content);
                 io.stopSpinner();
                 if (in_reasoning) {
-                    io.writeOut("\x1b[0m\r\n") catch {}; // dim off + separator
+                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n\r\n") catch {};
                     in_reasoning = false;
                 }
                 on_content(content);
@@ -196,7 +202,7 @@ pub fn streamChatCompletion(
                 defer sse.freeToolCallDelta(allocator, delta);
                 io.stopSpinner();
                 if (in_reasoning) {
-                    io.writeOut("\x1b[0m\r\n") catch {};
+                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n\r\n") catch {};
                     in_reasoning = false;
                 }
 
@@ -221,9 +227,10 @@ pub fn streamChatCompletion(
                     }
                 }
             },
-            .done => {
+            .done => |usage| {
+                if (usage) |u| final_usage = u;
                 if (in_reasoning) {
-                    io.writeOut("\x1b[0m\r\n") catch {}; // ensure reset
+                    io.writeOut("\r\n\x1b[2;3m</thinking>\x1b[0m\r\n") catch {};
                 }
                 break;
             },
@@ -261,10 +268,10 @@ pub fn streamChatCompletion(
             acc.name = .empty;
             acc.arguments = .empty;
         }
-        return .{ .tool_calls = try tool_calls.toOwnedSlice(allocator) };
+        return .{ .response = .{ .tool_calls = try tool_calls.toOwnedSlice(allocator) }, .usage = final_usage };
     }
 
-    return .{ .text = try response_buf.toOwnedSlice(allocator) };
+    return .{ .response = .{ .text = try response_buf.toOwnedSlice(allocator) }, .usage = final_usage };
 }
 
 /// Try to extract error.message from a JSON error response.

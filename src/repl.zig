@@ -31,6 +31,9 @@ const InputKey = union(enum) {
     unknown,
 };
 
+/// Maximum number of history entries to persist.
+const MAX_HISTORY_ENTRIES = 1000;
+
 /// Interactive REPL with line editing.
 ///
 /// Uses direct /dev/tty access with raw mode and manual escape sequence parsing.
@@ -401,8 +404,13 @@ pub const Repl = struct {
                 .enter => {
                     io.writeOut("\r\n") catch {};
                     const line = try self.allocator.dupe(u8, self.buf.items);
+                    // Deduplicate: skip if same as last history entry
                     if (line.len > 0) {
-                        try self.history.append(self.allocator, try self.allocator.dupe(u8, line));
+                        const is_dup = self.history.items.len > 0 and
+                            std.mem.eql(u8, self.history.items[self.history.items.len - 1], line);
+                        if (!is_dup) {
+                            try self.history.append(self.allocator, try self.allocator.dupe(u8, line));
+                        }
                     }
                     return line;
                 },
@@ -476,6 +484,61 @@ pub const Repl = struct {
             }
         }
     }
+
+    // ── Persistent history ────────────────────────────────────────────
+
+    /// Get the history file path (~/.config/zaica/history).
+    fn getHistoryPath(allocator: std.mem.Allocator) ?[]const u8 {
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fmt.allocPrint(allocator, "{s}/.config/zaica/history", .{home}) catch null;
+    }
+
+    /// Load history from disk. Silently ignores errors.
+    pub fn loadHistory(self: *Repl) void {
+        const path = getHistoryPath(self.allocator) orelse return;
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 10 * 1024 * 1024) catch return;
+        defer self.allocator.free(content);
+
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        while (iter.next()) |line| {
+            if (line.len == 0) continue;
+            const duped = self.allocator.dupe(u8, line) catch continue;
+            self.history.append(self.allocator, duped) catch {
+                self.allocator.free(duped);
+                continue;
+            };
+        }
+    }
+
+    /// Save history to disk. Silently ignores errors.
+    pub fn saveHistory(self: *Repl) void {
+        const path = getHistoryPath(self.allocator) orelse return;
+        defer self.allocator.free(path);
+
+        // Ensure config directory exists
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return,
+            };
+        }
+
+        const file = std.fs.createFileAbsolute(path, .{}) catch return;
+        defer file.close();
+
+        // Write last MAX_HISTORY_ENTRIES entries
+        const items = self.history.items;
+        const start = if (items.len > MAX_HISTORY_ENTRIES) items.len - MAX_HISTORY_ENTRIES else 0;
+        for (items[start..]) |entry| {
+            file.writeAll(entry) catch return;
+            file.writeAll("\n") catch return;
+        }
+    }
 };
 
 /// Free all allocator-owned memory in a ChatMessage.
@@ -532,6 +595,7 @@ fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
     io.writeOut("  /help   — show this help\r\n") catch {};
     io.writeOut("  /tools  — list available tools\r\n") catch {};
+    io.writeOut("  /usage  — show session token usage\r\n") catch {};
     io.writeOut("  /exit   — quit (also /quit, /q)\r\n") catch {};
     io.writeOut("\r\n\x1b[1mTool permissions:\x1b[0m\r\n") catch {};
     io.writeOut("  y — allow all tools\r\n") catch {};
@@ -552,7 +616,11 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     io.writeText("Type /help for commands, /exit to quit.\n\n") catch {};
 
     var repl = try Repl.init(allocator);
-    defer repl.deinit();
+    repl.loadHistory();
+    defer {
+        repl.saveHistory();
+        repl.deinit();
+    }
 
     // Conversation history (ChatMessage union)
     var history: std.ArrayList(message.ChatMessage) = .empty;
@@ -571,6 +639,10 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     // Session-level tool permission
     var permission_level: tools.PermissionLevel = .none;
 
+    // Session token counters
+    var session_prompt_tokens: u64 = 0;
+    var session_completion_tokens: u64 = 0;
+
     while (true) {
         const maybe_line = try repl.readLine();
         const line = maybe_line orelse break;
@@ -588,6 +660,14 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             printHelp();
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/usage")) {
+            io.writeOut("\r\n\x1b[1mSession token usage:\x1b[0m\r\n") catch {};
+            io.printOut("  Prompt tokens:     {d}\r\n", .{session_prompt_tokens}) catch {};
+            io.printOut("  Completion tokens: {d}\r\n", .{session_completion_tokens}) catch {};
+            io.printOut("  Total tokens:      {d}\r\n", .{session_prompt_tokens + session_completion_tokens}) catch {};
+            io.printOut("  Context limit:     {d}\r\n\r\n", .{resolved.config.max_context_tokens}) catch {};
+            continue;
+        }
 
         const user_content = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(user_content);
@@ -600,7 +680,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Terminal is in cooked mode here — streaming works normally
-            io.startSpinner();
+            io.startSpinner("Thinking...");
             const result = client.chatMessages(
                 allocator,
                 resolved,
@@ -616,7 +696,45 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 break;
             };
 
-            switch (result) {
+            // Track token usage
+            if (result.usage) |usage| {
+                session_prompt_tokens += usage.prompt_tokens;
+                session_completion_tokens += usage.completion_tokens;
+                io.printOut("\x1b[2m[tokens: {d} prompt + {d} completion = {d} | session: {d}]\x1b[0m\r\n", .{
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    session_prompt_tokens + session_completion_tokens,
+                }) catch {};
+
+                // Context window warnings and compaction
+                const max_ctx = resolved.config.max_context_tokens;
+                if (max_ctx > 0 and usage.prompt_tokens > 0) {
+                    const pct = (@as(u64, usage.prompt_tokens) * 100) / @as(u64, max_ctx);
+                    if (pct >= 90 and history.items.len > 5) {
+                        // Compact: keep system prompt [0] + last 4 messages
+                        const keep_tail: usize = 4;
+                        const remove_end = history.items.len - keep_tail;
+                        if (remove_end > 1) {
+                            const removed_count = remove_end - 1;
+                            for (history.items[1..remove_end]) |msg| {
+                                freeMessage(allocator, msg);
+                            }
+                            std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[remove_end..]);
+                            history.shrinkRetainingCapacity(1 + keep_tail);
+                            io.printOut("\x1b[33m[context compacted: dropped {d} old messages]\x1b[0m\r\n", .{removed_count}) catch {};
+                        }
+                    } else if (pct >= 80) {
+                        io.printOut("\x1b[33m[warning: {d}% context window used ({d}k/{d}k tokens)]\x1b[0m\r\n", .{
+                            pct,
+                            usage.prompt_tokens / 1000,
+                            max_ctx / 1000,
+                        }) catch {};
+                    }
+                }
+            }
+
+            switch (result.response) {
                 .text => |text| {
                     io.writeOut("\r\n") catch {};
                     try history.append(allocator, .{
@@ -686,7 +804,13 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 .content = std.fmt.allocPrint(allocator, "Permission denied: {s} requires full tool access (safe-only mode active).", .{tc.function.name}) catch try allocator.dupe(u8, "Permission denied."),
                             };
                         } else {
-                            io.printOut("\x1b[2m  → {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
+                            // Show tool name + key arg
+                            if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
+                                defer allocator.free(key_arg);
+                                io.printOut("\x1b[2m  → {s} \x1b[2;3m{s}\x1b[0m\r\n", .{ tc.function.name, key_arg }) catch {};
+                            } else {
+                                io.printOut("\x1b[2m  → {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
+                            }
                             thread_indices[thread_count] = i;
                             thread_count += 1;
                         }
@@ -694,7 +818,24 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // Execute allowed tools in background threads with spinner
                     if (thread_count > 0) {
-                        io.startSpinner();
+                        // Build label from tool names: "read_file, execute_bash"
+                        var label_buf: [256]u8 = undefined;
+                        var label_pos: usize = 0;
+                        for (thread_indices[0..thread_count]) |idx| {
+                            const name = tcs[idx].function.name;
+                            if (label_pos > 0) {
+                                if (label_pos + 2 <= label_buf.len) {
+                                    @memcpy(label_buf[label_pos..][0..2], ", ");
+                                    label_pos += 2;
+                                }
+                            }
+                            const copy_len = @min(name.len, label_buf.len - label_pos);
+                            if (copy_len > 0) {
+                                @memcpy(label_buf[label_pos..][0..copy_len], name[0..copy_len]);
+                                label_pos += copy_len;
+                            }
+                        }
+                        io.startSpinner(label_buf[0..label_pos]);
 
                         const threads = try allocator.alloc(?std.Thread, thread_count);
                         defer allocator.free(threads);
@@ -724,12 +865,18 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     for (tcs, 0..) |tc, i| {
                         const content = tool_results[i].content;
                         if (content.len == 0) continue;
-                        // Tool name header
-                        io.printOut("\x1b[2m  ┌ {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
+                        // Tool name header with key arg
+                        if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
+                            defer allocator.free(key_arg);
+                            io.printOut("\x1b[2m  ┌ {s} \x1b[2;3m{s}\x1b[0m\r\n", .{ tc.function.name, key_arg }) catch {};
+                        } else {
+                            io.printOut("\x1b[2m  ┌ {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
+                        }
                         // Truncate long output
                         const max_preview = 1024;
                         const preview = if (content.len > max_preview) content[0..max_preview] else content;
-                        io.writeOut("\x1b[2m") catch {};
+                        const color: []const u8 = if (isErrorOutput(content)) "\x1b[31m" else "\x1b[2m";
+                        io.writeOut(color) catch {};
                         io.writeText(preview) catch {};
                         if (content.len > max_preview) {
                             io.printOut("\r\n  ... ({d} bytes total)", .{content.len}) catch {};
@@ -779,6 +926,38 @@ fn truncateArgs(args: []const u8) []const u8 {
     return args[0..80];
 }
 
+/// Extract the primary argument from a tool call's JSON args for display.
+/// Returns a short string like "src/main.zig" or "echo hello", truncated at 80 chars.
+fn extractKeyArg(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    // Map tool names to their primary argument key
+    const key = if (std.mem.eql(u8, tool_name, "execute_bash"))
+        "command"
+    else if (std.mem.eql(u8, tool_name, "read_file") or
+        std.mem.eql(u8, tool_name, "write_file") or
+        std.mem.eql(u8, tool_name, "list_files"))
+        "path"
+    else if (std.mem.eql(u8, tool_name, "search_files"))
+        "pattern"
+    else
+        return null;
+
+    const val = parsed.value.object.get(key) orelse return null;
+    if (val != .string or val.string.len == 0) return null;
+    const s = val.string;
+    const max_len: usize = 80;
+    return allocator.dupe(u8, if (s.len > max_len) s[0..max_len] else s) catch null;
+}
+
+/// Check if tool output looks like an error.
+fn isErrorOutput(content: []const u8) bool {
+    return std.mem.startsWith(u8, content, "Error") or
+        std.mem.startsWith(u8, content, "Permission denied");
+}
+
 test {
     _ = Repl;
 }
@@ -810,4 +989,37 @@ test "isExitCommand: non-exit input" {
     try std.testing.expect(!isExitCommand("exit"));
     try std.testing.expect(!isExitCommand(""));
     try std.testing.expect(!isExitCommand("/привет"));
+}
+
+test "extractKeyArg: read_file returns path" {
+    const allocator = std.testing.allocator;
+    const result = extractKeyArg(allocator, "read_file", "{\"path\":\"src/main.zig\"}");
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings("src/main.zig", result.?);
+}
+
+test "extractKeyArg: execute_bash returns command" {
+    const allocator = std.testing.allocator;
+    const result = extractKeyArg(allocator, "execute_bash", "{\"command\":\"echo hello\"}");
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings("echo hello", result.?);
+}
+
+test "extractKeyArg: unknown tool returns null" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(extractKeyArg(allocator, "unknown", "{}") == null);
+}
+
+test "extractKeyArg: invalid JSON returns null" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(extractKeyArg(allocator, "read_file", "not json") == null);
+}
+
+test "isErrorOutput: detects errors" {
+    try std.testing.expect(isErrorOutput("Error: file not found"));
+    try std.testing.expect(isErrorOutput("Permission denied: read_file"));
+    try std.testing.expect(!isErrorOutput("file contents here"));
+    try std.testing.expect(!isErrorOutput(""));
 }

@@ -57,7 +57,7 @@ pub fn chat(
     // Final newline after streamed content
     io.writeOut("\r\n") catch {};
 
-    switch (result) {
+    switch (result.response) {
         .text => |t| return t,
         .tool_calls => |tcs| {
             // Single-shot mode shouldn't get tool calls (no tools sent)

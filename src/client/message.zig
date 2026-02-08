@@ -93,7 +93,7 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, request: ChatRequest) ![]c
     try writer.print("{d:.1}", .{request.temperature});
 
     if (request.stream) {
-        try writer.writeAll(",\"stream\":true");
+        try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
     }
 
     if (request.tools) |tools| {

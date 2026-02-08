@@ -47,7 +47,7 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
     errdefer arena.deinit();
 
     // Load and merge all config layers
-    const resolved = loader.loadConfig(arena.allocator(), &cli_args) catch {
+    var resolved = loader.loadConfig(arena.allocator(), &cli_args) catch {
         return error.ConfigError;
     };
 
@@ -65,7 +65,17 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         );
         // For --dump-config, allow proceeding without key
         if (!cli_args.dump_config) {
-            return error.ConfigError;
+            // Try interactive prompt
+            if (auth.promptApiKey(arena.allocator())) |key| {
+                auth.saveApiKey(arena.allocator(), resolved.config.provider, key) catch {
+                    io.writeErr("Failed to save API key.\n");
+                    return error.ConfigError;
+                };
+                io.writeErr("API key saved to ~/.config/zaica/auth.json\n\n");
+                resolved.auth = .{ .api_key = key, .key_source = .auth_file };
+            } else {
+                return error.ConfigError;
+            }
         }
     }
 
