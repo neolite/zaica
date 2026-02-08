@@ -600,7 +600,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Terminal is in cooked mode here — streaming works normally
-            io.showThinking();
+            io.startSpinner();
             const result = client.chatMessages(
                 allocator,
                 resolved,
@@ -666,29 +666,85 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         .tool_use = .{ .tool_calls = tcs },
                     });
 
-                    // Execute each tool, checking per-tool permissions
-                    for (tcs) |tc| {
+                    // Execute tools, checking per-tool permissions.
+                    // Multiple allowed tools run in parallel via std.Thread.
+                    const tool_results = try allocator.alloc(ToolResult, tcs.len);
+                    defer allocator.free(tool_results);
+                    @memset(tool_results, .{ .tool_call_id = "", .content = "" });
+
+                    // Indices of allowed tools that need execution
+                    const thread_indices = try allocator.alloc(usize, tcs.len);
+                    defer allocator.free(thread_indices);
+                    var thread_count: usize = 0;
+
+                    // First pass: check permissions, print status, fill denied results
+                    for (tcs, 0..) |tc, i| {
                         if (!tools.isAllowed(tc.function.name, permission_level)) {
                             io.printOut("\x1b[33m  x {s} (not allowed)\x1b[0m\r\n", .{tc.function.name}) catch {};
-                            const denied_id = try allocator.dupe(u8, tc.id);
-                            const denied_msg = std.fmt.allocPrint(allocator, "Permission denied: {s} requires full tool access (safe-only mode active).", .{tc.function.name}) catch try allocator.dupe(u8, "Permission denied.");
-                            try history.append(allocator, .{
-                                .tool_result = .{
-                                    .tool_call_id = denied_id,
-                                    .content = denied_msg,
-                                },
-                            });
+                            tool_results[i] = .{
+                                .tool_call_id = try allocator.dupe(u8, tc.id),
+                                .content = std.fmt.allocPrint(allocator, "Permission denied: {s} requires full tool access (safe-only mode active).", .{tc.function.name}) catch try allocator.dupe(u8, "Permission denied."),
+                            };
                         } else {
                             io.printOut("\x1b[2m  → {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
-                            const tool_result = tools.execute(allocator, tc);
-                            const result_id = try allocator.dupe(u8, tc.id);
-                            try history.append(allocator, .{
-                                .tool_result = .{
-                                    .tool_call_id = result_id,
-                                    .content = tool_result,
-                                },
-                            });
+                            thread_indices[thread_count] = i;
+                            thread_count += 1;
                         }
+                    }
+
+                    // Execute allowed tools in background threads with spinner
+                    if (thread_count > 0) {
+                        io.startSpinner();
+
+                        const threads = try allocator.alloc(?std.Thread, thread_count);
+                        defer allocator.free(threads);
+                        @memset(threads, null);
+
+                        for (thread_indices[0..thread_count], 0..) |idx, j| {
+                            threads[j] = std.Thread.spawn(.{}, executeToolThread, .{
+                                allocator, tcs[idx], &tool_results[idx],
+                            }) catch null;
+                        }
+
+                        for (thread_indices[0..thread_count], 0..) |idx, j| {
+                            if (threads[j]) |t| {
+                                t.join();
+                            } else {
+                                tool_results[idx] = .{
+                                    .tool_call_id = allocator.dupe(u8, tcs[idx].id) catch "",
+                                    .content = tools.execute(allocator, tcs[idx]),
+                                };
+                            }
+                        }
+
+                        io.stopSpinner();
+                    }
+
+                    // Print tool results so the user can see what happened
+                    for (tcs, 0..) |tc, i| {
+                        const content = tool_results[i].content;
+                        if (content.len == 0) continue;
+                        // Tool name header
+                        io.printOut("\x1b[2m  ┌ {s}\x1b[0m\r\n", .{tc.function.name}) catch {};
+                        // Truncate long output
+                        const max_preview = 1024;
+                        const preview = if (content.len > max_preview) content[0..max_preview] else content;
+                        io.writeOut("\x1b[2m") catch {};
+                        io.writeText(preview) catch {};
+                        if (content.len > max_preview) {
+                            io.printOut("\r\n  ... ({d} bytes total)", .{content.len}) catch {};
+                        }
+                        io.writeOut("\x1b[0m\r\n") catch {};
+                    }
+
+                    // Append all results to history in order
+                    for (tool_results) |tr| {
+                        try history.append(allocator, .{
+                            .tool_result = .{
+                                .tool_call_id = tr.tool_call_id,
+                                .content = tr.content,
+                            },
+                        });
                     }
                 },
             }
@@ -698,6 +754,23 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             io.writeOut("\x1b[33m(agent loop limit reached)\x1b[0m\r\n") catch {};
         }
     }
+}
+
+/// Result of a single tool execution, used for parallel collection.
+const ToolResult = struct {
+    tool_call_id: []const u8,
+    content: []const u8,
+};
+
+/// Thread entry point for parallel tool execution.
+/// Each thread writes to its own slot in the results array.
+fn executeToolThread(
+    allocator: std.mem.Allocator,
+    tc: message.ToolCall,
+    result: *ToolResult,
+) void {
+    result.content = tools.execute(allocator, tc);
+    result.tool_call_id = allocator.dupe(u8, tc.id) catch "";
 }
 
 /// Truncate tool arguments for display (max 80 chars).

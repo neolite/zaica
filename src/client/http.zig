@@ -175,7 +175,7 @@ pub fn streamChatCompletion(
         switch (event) {
             .reasoning => |text| {
                 defer allocator.free(text);
-                io.clearThinking();
+                io.stopSpinner();
                 if (!in_reasoning) {
                     io.writeOut("\x1b[2m") catch {}; // dim on
                     in_reasoning = true;
@@ -184,7 +184,7 @@ pub fn streamChatCompletion(
             },
             .content => |content| {
                 defer allocator.free(content);
-                io.clearThinking();
+                io.stopSpinner();
                 if (in_reasoning) {
                     io.writeOut("\x1b[0m\r\n") catch {}; // dim off + separator
                     in_reasoning = false;
@@ -194,7 +194,7 @@ pub fn streamChatCompletion(
             },
             .tool_call_delta => |delta| {
                 defer sse.freeToolCallDelta(allocator, delta);
-                io.clearThinking();
+                io.stopSpinner();
                 if (in_reasoning) {
                     io.writeOut("\x1b[0m\r\n") catch {};
                     in_reasoning = false;
@@ -229,7 +229,7 @@ pub fn streamChatCompletion(
             },
             .api_error => |err_msg| {
                 defer allocator.free(err_msg);
-                io.clearThinking();
+                io.stopSpinner();
                 if (in_reasoning) {
                     io.writeOut("\x1b[0m") catch {};
                 }

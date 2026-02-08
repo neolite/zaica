@@ -52,21 +52,41 @@ pub fn printText(comptime fmt: []const u8, args: anytype) !void {
     try writeText(text);
 }
 
-/// "Thinking..." indicator state — cleared on first streamed output.
-var thinking_active: bool = false;
+/// Atomic flag to signal spinner thread to stop.
+var spinner_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Handle to the background spinner thread (null when not running).
+var spinner_thread: ?std.Thread = null;
 
-/// Show a dim thinking indicator (cleared automatically on first output).
-pub fn showThinking() void {
-    thinking_active = true;
-    writeOut("\x1b[2m...\x1b[0m") catch {};
+/// Start animated spinner in a background thread.
+/// The spinner cycles through braille frames at 80ms intervals.
+/// Call stopSpinner() to halt and clear the spinner line.
+pub fn startSpinner() void {
+    spinner_stop.store(false, .release);
+    spinner_thread = std.Thread.spawn(.{}, spinnerLoop, .{}) catch null;
 }
 
-/// Clear the thinking indicator if active.
-pub fn clearThinking() void {
-    if (thinking_active) {
-        writeOut("\r\x1b[K") catch {};
-        thinking_active = false;
+/// Stop the spinner and clear the line. Safe to call even if not running.
+/// Blocks until the spinner thread has fully exited.
+pub fn stopSpinner() void {
+    if (spinner_thread) |t| {
+        spinner_stop.store(true, .release);
+        t.join();
+        spinner_thread = null;
     }
+}
+
+/// Background spinner loop — writes braille animation frames to stdout.
+fn spinnerLoop() void {
+    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    var i: usize = 0;
+    while (!spinner_stop.load(.acquire)) {
+        writeOut("\r\x1b[2m") catch {};
+        writeOut(frames[i % frames.len]) catch {};
+        writeOut(" \x1b[0m") catch {};
+        std.Thread.sleep(80_000_000); // 80ms
+        i +%= 1;
+    }
+    writeOut("\r\x1b[K") catch {}; // clear spinner line
 }
 
 /// Get a buffered stdout writer for streaming output.
