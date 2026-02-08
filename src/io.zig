@@ -56,7 +56,7 @@ pub fn resetScrollRegion() void {
 pub fn renderStatusBar(rows: u16, content: []const u8) void {
     writeOut("\x1b7") catch {}; // save cursor
     printOut("\x1b[{d};1H", .{rows}) catch {}; // move to last row
-    writeOut("\x1b[7m") catch {}; // reverse video (white-on-black)
+    writeOut("\x1b[2m") catch {}; // dim text (no background fill)
     writeOut(content) catch {};
     writeOut("\x1b[K") catch {}; // clear rest of line
     writeOut("\x1b[0m") catch {}; // reset attributes
@@ -162,64 +162,66 @@ pub fn isSpinnerActive() bool {
     return spinner_thread != null;
 }
 
-/// Stop the spinner and render the idle status bar. Safe to call even if not running.
+/// Stop the spinner and clear its line in the scroll region. Safe to call even if not running.
 pub fn stopSpinner() void {
     if (spinner_thread) |t| {
         spinner_stop.store(true, .release);
         t.join();
         spinner_thread = null;
-        // Re-render status bar without spinner
-        renderStatusBarIdle();
+        // Clear spinner line in scroll region
+        writeOut("\r\x1b[K") catch {};
     }
 }
 
 /// Braille spinner frames (each is 3 bytes UTF-8).
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/// Background spinner loop — renders full status bar with animated spinner.
+/// Background spinner loop — renders animated spinner in the scroll region.
+/// Uses \r to overwrite the current line in-place.
 fn spinnerLoop() void {
     var i: usize = 0;
     while (!spinner_stop.load(.acquire)) {
-        const rows = status_rows.load(.acquire);
         const label_len = spinner_label_len.load(.acquire);
-        const static_len = status_static_len.load(.acquire);
 
-        // Build status bar: " ⠋ Label │ static... "
-        var buf: [768]u8 = undefined;
+        // Build: "\r\x1b[K \x1b[95m⠋\x1b[0m \x1b[2mLabel\x1b[0m"
+        var buf: [300]u8 = undefined;
         var pos: usize = 0;
 
-        // Leading space
-        buf[pos] = ' ';
-        pos += 1;
+        // Return to line start + clear + leading space
+        const prefix = "\r\x1b[K ";
+        @memcpy(buf[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
 
-        // Spinner frame
+        // Spinner frame in magenta
+        const color_on = "\x1b[95m";
+        @memcpy(buf[pos..][0..color_on.len], color_on);
+        pos += color_on.len;
+
         const frame = spinner_frames[i % spinner_frames.len];
         @memcpy(buf[pos..][0..frame.len], frame);
         pos += frame.len;
 
-        buf[pos] = ' ';
-        pos += 1;
+        const color_off = "\x1b[0m ";
+        @memcpy(buf[pos..][0..color_off.len], color_off);
+        pos += color_off.len;
 
-        // Label
+        // Label in dim
         if (label_len > 0) {
-            const copy = @min(label_len, buf.len - pos);
+            const dim_on = "\x1b[2m";
+            @memcpy(buf[pos..][0..dim_on.len], dim_on);
+            pos += dim_on.len;
+
+            const copy = @min(label_len, buf.len - pos - 4);
             @memcpy(buf[pos..][0..copy], spinner_label[0..copy]);
             pos += copy;
         }
 
-        // Separator + static portion
-        if (static_len > 0) {
-            const sep = " \xe2\x94\x82 "; // " │ " (UTF-8)
-            const sep_len = sep.len;
-            if (pos + sep_len + static_len < buf.len) {
-                @memcpy(buf[pos..][0..sep_len], sep);
-                pos += sep_len;
-                @memcpy(buf[pos..][0..static_len], status_static[0..static_len]);
-                pos += static_len;
-            }
-        }
+        // Reset
+        const reset = "\x1b[0m";
+        @memcpy(buf[pos..][0..reset.len], reset);
+        pos += reset.len;
 
-        renderStatusBar(rows, buf[0..pos]);
+        writeOut(buf[0..pos]) catch {};
 
         std.Thread.sleep(80_000_000); // 80ms
         i +%= 1;

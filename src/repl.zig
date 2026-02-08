@@ -124,6 +124,16 @@ pub const Repl = struct {
         posix.tcsetattr(self.fd, .FLUSH, self.original_termios) catch {};
     }
 
+    /// Enter streaming mode: OPOST for correct \n handling, but ECHO off
+    /// to suppress stray input (e.g., trackpad scroll → ^[[A/^[[B).
+    fn streamMode(self: *Repl) void {
+        var tio = self.original_termios;
+        tio.oflag.OPOST = true;
+        tio.lflag.ECHO = false;
+        tio.lflag.ICANON = false;
+        posix.tcsetattr(self.fd, .FLUSH, tio) catch {};
+    }
+
     // ── Low-level byte reads ──────────────────────────────────────────
 
     /// Read a single byte, blocking until available.
@@ -437,7 +447,7 @@ pub const Repl = struct {
         self.saved_line.clearRetainingCapacity();
 
         self.uncook();
-        defer self.cook();
+        defer self.streamMode(); // OPOST on, ECHO off — suppresses trackpad scroll noise
 
         self.renderLine();
 
@@ -509,7 +519,7 @@ pub const Repl = struct {
     /// y = allow all tools, s = safe only (read/search), n = deny all.
     pub fn readPermission(self: *Repl) !tools.PermissionLevel {
         self.uncook();
-        defer self.cook();
+        defer self.streamMode();
         while (true) {
             const byte = try self.readByte() orelse return .none;
             switch (byte) {
@@ -722,12 +732,8 @@ const StatusBar = struct {
         const len = self.formatStatic(&buf);
         io.setStatusStatic(buf[0..len]);
         io.setStatusRows(self.rows);
-        // Only render directly if no spinner is running — otherwise the spinner
-        // thread handles rendering and concurrent \x1b7/\x1b8 would corrupt
-        // the saved cursor position.
-        if (!io.isSpinnerActive()) {
-            self.render();
-        }
+        // Spinner now renders in scroll region, not status bar — safe to render always.
+        self.render();
     }
 
     fn updateTokens(self: *StatusBar, used: u64) void {
@@ -865,6 +871,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     posix.sigaction(posix.SIG.WINCH, &sa, null);
 
     var repl = try Repl.init(allocator);
+    repl.streamMode(); // start in stream mode (ECHO off) to suppress stray input
     repl.loadHistory();
     defer {
         // Restore terminal state: reset scroll region, ensure cursor visible, restore main screen
