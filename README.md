@@ -4,6 +4,8 @@
 
 A lightweight coding assistant that runs in your terminal, calls tools autonomously, and streams responses in real-time. Built from scratch in Zig 0.15 with zero runtime dependencies beyond the standard library.
 
+![zaica demo](./demo.gif)
+
 ## Features
 
 - **Multi-provider**: GLM, OpenAI, Anthropic, DeepSeek, Ollama (OpenAI-compatible API)
