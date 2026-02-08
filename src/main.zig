@@ -51,5 +51,6 @@ test {
     _ = @import("config/mod.zig");
     _ = @import("client/mod.zig");
     _ = @import("repl.zig");
+    _ = @import("state.zig");
     _ = @import("tools.zig");
 }

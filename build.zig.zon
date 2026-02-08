@@ -1,12 +1,15 @@
 .{
     .name = .zaica,
-    .version = "0.1.0",
+    .version = "0.3.0",
     .fingerprint = 0xc5b9061095f47fe6,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .vaxis = .{
             .url = "https://github.com/rockorager/libvaxis/archive/refs/heads/master.tar.gz",
             .hash = "vaxis-0.5.1-BWNV_Bw_CQAIVNh1ekGVzbip25CYBQ_J3kgABnYGFnI4",
+        },
+        .zefx = .{
+            .path = "lib/zefx",
         },
     },
     .paths = .{

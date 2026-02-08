@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zefx_dep = b.dependency("zefx", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -20,6 +24,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
+    exe.root_module.addImport("zefx", zefx_dep.module("zefx"));
     b.installArtifact(exe);
 
     // Run step
@@ -40,6 +45,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
+    unit_tests.root_module.addImport("zefx", zefx_dep.module("zefx"));
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);

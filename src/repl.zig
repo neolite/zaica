@@ -6,6 +6,7 @@ const client = @import("client/mod.zig");
 const message = client.message;
 const io = @import("io.zig");
 const tools = @import("tools.zig");
+const state = @import("state.zig");
 
 /// Key event from terminal input.
 const InputKey = union(enum) {
@@ -646,163 +647,7 @@ fn isExitCommand(input: []const u8) bool {
 /// Visual separator between input and output.
 const SEPARATOR = "";
 
-// ── Status Bar ────────────────────────────────────────────────────────
-
-/// Persistent status bar rendered on the last terminal row.
-/// Displays: [spinner+phase] │ model │ tokens/limit (N%) │ permission │ elapsed
-const StatusBar = struct {
-    model_name: []const u8,
-    tokens_used: u64,
-    context_limit: u32,
-    permission: tools.PermissionLevel,
-    start_time: i64,
-    rows: u16,
-    cols: u16,
-
-    /// Format the static portion of the status bar (everything except spinner).
-    /// Returns the number of bytes written into `buf`.
-    fn formatStatic(self: *const StatusBar, buf: []u8) usize {
-        var pos: usize = 0;
-
-        // Model name
-        const model = self.model_name;
-        const model_len = @min(model.len, 24); // truncate long model names
-        if (pos + model_len < buf.len) {
-            @memcpy(buf[pos..][0..model_len], model[0..model_len]);
-            pos += model_len;
-        }
-
-        // Separator " │ "
-        const sep = " \xe2\x94\x82 "; // " │ " UTF-8
-        if (pos + sep.len < buf.len) {
-            @memcpy(buf[pos..][0..sep.len], sep);
-            pos += sep.len;
-        }
-
-        // Tokens: "1.2k/128k (1%)"
-        pos += formatTokens(buf[pos..], self.tokens_used, self.context_limit);
-
-        // Separator
-        if (pos + sep.len < buf.len) {
-            @memcpy(buf[pos..][0..sep.len], sep);
-            pos += sep.len;
-        }
-
-        // Permission level
-        const perm_str = switch (self.permission) {
-            .all => "all",
-            .safe_only => "safe",
-            .none => "ask",
-        };
-        if (pos + perm_str.len < buf.len) {
-            @memcpy(buf[pos..][0..perm_str.len], perm_str);
-            pos += perm_str.len;
-        }
-
-        // Separator
-        if (pos + sep.len < buf.len) {
-            @memcpy(buf[pos..][0..sep.len], sep);
-            pos += sep.len;
-        }
-
-        // Elapsed time "H:MM:SS"
-        pos += formatElapsed(buf[pos..], self.start_time);
-
-        // Trailing space
-        if (pos < buf.len) {
-            buf[pos] = ' ';
-            pos += 1;
-        }
-
-        return pos;
-    }
-
-    /// Render the status bar in idle mode (no spinner).
-    fn render(self: *StatusBar) void {
-        var buf: [512]u8 = undefined;
-        buf[0] = ' ';
-        const len = self.formatStatic(buf[1..]);
-        io.renderStatusBar(self.rows, buf[0 .. len + 1]);
-    }
-
-    /// Update the static content visible to the spinner thread, then re-render.
-    /// Skips direct render when spinner is active (spinner handles its own renders).
-    fn syncAndRender(self: *StatusBar) void {
-        var buf: [512]u8 = undefined;
-        const len = self.formatStatic(&buf);
-        io.setStatusStatic(buf[0..len]);
-        io.setStatusRows(self.rows);
-        // Spinner now renders in scroll region, not status bar — safe to render always.
-        self.render();
-    }
-
-    fn updateTokens(self: *StatusBar, used: u64) void {
-        self.tokens_used = used;
-        self.syncAndRender();
-    }
-
-    fn setPermission(self: *StatusBar, perm: tools.PermissionLevel) void {
-        self.permission = perm;
-        self.syncAndRender();
-    }
-
-    fn resize(self: *StatusBar) void {
-        const term = io.getTerminalSize();
-        self.rows = term.rows;
-        self.cols = term.cols;
-        io.setupScrollRegion(self.rows);
-        io.renderSeparator(self.rows - 3, self.cols); // top separator
-        io.renderSeparator(self.rows - 1, self.cols); // bottom separator
-        io.printOut("\x1b[{d};1H", .{self.rows - 4}) catch {}; // cursor back to scroll region
-        self.syncAndRender();
-    }
-
-    // ── Formatting helpers ────────────────────────────────────────
-
-    /// Format token count with K suffix: 0 → "0", 1234 → "1.2k", 128000 → "128k".
-    fn formatK(buf: []u8, value: u64) usize {
-        if (value == 0) {
-            buf[0] = '0';
-            return 1;
-        }
-        if (value < 1000) {
-            return (std.fmt.bufPrint(buf, "{d}", .{value}) catch return 0).len;
-        }
-        if (value < 10000) {
-            // 1.2k format
-            const whole = value / 1000;
-            const frac = (value % 1000) / 100;
-            return (std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, frac }) catch return 0).len;
-        }
-        // 12k, 128k format
-        return (std.fmt.bufPrint(buf, "{d}k", .{value / 1000}) catch return 0).len;
-    }
-
-    /// Format "used/limit (N%)" token display.
-    fn formatTokens(buf: []u8, used: u64, limit: u32) usize {
-        var pos: usize = 0;
-        pos += formatK(buf[pos..], used);
-        buf[pos] = '/';
-        pos += 1;
-        pos += formatK(buf[pos..], @as(u64, limit));
-
-        const pct: u64 = if (limit > 0) (used * 100) / @as(u64, limit) else 0;
-        const pct_str = std.fmt.bufPrint(buf[pos..], " ({d}%)", .{pct}) catch return pos;
-        pos += pct_str.len;
-        return pos;
-    }
-
-    /// Format elapsed time as "H:MM:SS" from a start timestamp.
-    fn formatElapsed(buf: []u8, start_time: i64) usize {
-        const now = std.time.timestamp();
-        const elapsed: u64 = if (now > start_time) @intCast(now - start_time) else 0;
-        const hours = elapsed / 3600;
-        const mins = (elapsed % 3600) / 60;
-        const secs = elapsed % 60;
-        const result = std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ hours, mins, secs }) catch return 0;
-        return result.len;
-    }
-};
+// StatusBar is now managed reactively via src/state.zig (zefx stores + watchers).
 
 fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
@@ -845,22 +690,15 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     io.printOut("\x1b[{d};1H", .{term.rows - 4}) catch {};
 
     // Print banner — scrolls up naturally from the bottom
-    io.printText("\x1b[1mzaica\x1b[0m v0.2 \xc2\xb7 {s}/{s}\n", .{
+    io.printText("\x1b[1mzaica\x1b[0m v0.3 \xc2\xb7 {s}/{s}\n", .{
         resolved.config.provider,
         resolved.resolved_model,
     }) catch {};
     io.writeText("\x1b[2mType /help for commands, /exit to quit.\x1b[0m\n\n") catch {};
 
-    var status = StatusBar{
-        .model_name = resolved.resolved_model,
-        .tokens_used = 0,
-        .context_limit = resolved.config.max_context_tokens,
-        .permission = .none,
-        .start_time = std.time.timestamp(),
-        .rows = term.rows,
-        .cols = term.cols,
-    };
-    status.syncAndRender();
+    var session = state.init(allocator, resolved.resolved_model, resolved.config.max_context_tokens, term.rows, term.cols);
+    state.bind(&session); // Set stable pointer for watchers + initial render
+    defer session.deinit();
 
     // Install SIGWINCH handler for terminal resize
     const sa = posix.Sigaction{
@@ -899,14 +737,11 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     // Session-level tool permission
     var permission_level: tools.PermissionLevel = .none;
 
-    // Session token counters
-    var session_prompt_tokens: u64 = 0;
-    var session_completion_tokens: u64 = 0;
-
     while (true) {
         // Check for terminal resize
         if (sigwinch_received.swap(false, .acquire)) {
-            status.resize();
+            const ts = io.getTerminalSize();
+            session.events.terminal_resized.emit(.{ .rows = ts.rows, .cols = ts.cols });
         }
 
         // Show cursor (entering input mode) + save scroll region cursor
@@ -943,9 +778,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         }
         if (std.mem.eql(u8, trimmed, "/usage")) {
             io.writeOut("\r\n\x1b[1mSession token usage:\x1b[0m\r\n") catch {};
-            io.printOut("  Prompt tokens:     {d}\r\n", .{session_prompt_tokens}) catch {};
-            io.printOut("  Completion tokens: {d}\r\n", .{session_completion_tokens}) catch {};
-            io.printOut("  Total tokens:      {d}\r\n", .{session_prompt_tokens + session_completion_tokens}) catch {};
+            io.printOut("  Prompt tokens:     {d}\r\n", .{session.stores.prompt_tokens.get()}) catch {};
+            io.printOut("  Completion tokens: {d}\r\n", .{session.stores.completion_tokens.get()}) catch {};
+            io.printOut("  Total tokens:      {d}\r\n", .{session.stores.total_tokens.get()}) catch {};
             io.printOut("  Context limit:     {d}\r\n\r\n", .{resolved.config.max_context_tokens}) catch {};
             continue;
         }
@@ -961,7 +796,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Terminal is in cooked mode here — streaming works normally
-            status.syncAndRender();
+            state.syncStatus(&session);
             io.startSpinner("Thinking...");
             const result = client.chatMessages(
                 allocator,
@@ -981,10 +816,10 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
             // Track token usage
             if (result.usage) |usage| {
-                session_prompt_tokens += usage.prompt_tokens;
-                session_completion_tokens += usage.completion_tokens;
-                // Update status bar with cumulative token count
-                status.updateTokens(session_prompt_tokens + session_completion_tokens);
+                session.events.tokens_received.emit(.{
+                    .prompt_tokens = usage.prompt_tokens,
+                    .completion_tokens = usage.completion_tokens,
+                });
 
                 // Context window warnings and compaction
                 const max_ctx = resolved.config.max_context_tokens;
@@ -1045,7 +880,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
 
                         permission_level = repl.readPermission() catch .none;
-                        status.setPermission(permission_level);
+                        session.events.permission_granted.emit(permission_level);
                         if (permission_level == .none) {
                             // Deny all tools
                             try history.append(allocator, .{
@@ -1128,7 +963,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 label_pos += copy_len;
                             }
                         }
-                        status.syncAndRender();
+                        state.syncStatus(&session);
                         io.startSpinner(label_buf[0..label_pos]);
 
                         const threads = try allocator.alloc(?std.Thread, thread_count);
