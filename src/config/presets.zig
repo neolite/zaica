@@ -7,6 +7,7 @@ pub const all = [_]ProviderPreset{
     glm,
     anthropic,
     openai,
+    openrouter,
     deepseek,
     ollama,
 };
@@ -35,6 +36,15 @@ pub const openai = ProviderPreset{
     .base_url = "https://api.openai.com/v1",
     .key_env_var = "OPENAI_API_KEY",
     .default_model = "gpt-4o",
+    .chat_completions_path = "/chat/completions",
+    .requires_key = true,
+};
+
+pub const openrouter = ProviderPreset{
+    .name = "openrouter",
+    .base_url = "https://openrouter.ai/api/v1",
+    .key_env_var = "OPENROUTER_API_KEY",
+    .default_model = "openrouter/aurora-alpha",
     .chat_completions_path = "/chat/completions",
     .requires_key = true,
 };
@@ -69,7 +79,7 @@ pub fn findByName(name: []const u8) ?ProviderPreset {
 
 /// Return a comma-separated list of available provider names.
 pub fn availableNames() []const u8 {
-    return "glm, anthropic, openai, deepseek, ollama";
+    return "glm, anthropic, openai, openrouter, deepseek, ollama";
 }
 
 test "findByName: known providers" {
@@ -77,6 +87,7 @@ test "findByName: known providers" {
     try std.testing.expect(findByName("anthropic") != null);
     try std.testing.expect(findByName("openai") != null);
     try std.testing.expect(findByName("deepseek") != null);
+    try std.testing.expect(findByName("openrouter") != null);
     try std.testing.expect(findByName("ollama") != null);
 }
 

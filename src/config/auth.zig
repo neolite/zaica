@@ -123,6 +123,42 @@ pub fn printKeyError(provider_name: []const u8, provider_key_env: ?[]const u8) v
     io.writeErr("  4. Auth file:    ~/.config/zaica/auth.json\n\n");
 }
 
+/// Prompt the user to select a provider from a numbered list.
+/// Returns the selected preset index (0-based), or null if cancelled.
+pub fn promptProviderSelection() ?usize {
+    const providers = @import("presets.zig").all;
+    io.writeErr("\n\x1b[1mSelect a provider:\x1b[0m\n");
+    inline for (providers, 0..) |p, i| {
+        io.printErr("  \x1b[95m{d}\x1b[0m. {s}", .{ i + 1, p.name });
+        if (!p.requires_key) {
+            io.writeErr(" (no key needed)");
+        }
+        io.writeErr("\n");
+    }
+    io.writeErr("\nEnter number: ");
+
+    // Read from /dev/tty
+    const fd = posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer posix.close(fd);
+
+    var buf: [8]u8 = undefined;
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        var byte_buf: [1]u8 = undefined;
+        const n = posix.read(fd, &byte_buf) catch break;
+        if (n == 0) break;
+        if (byte_buf[0] == '\n' or byte_buf[0] == '\r') break;
+        if (byte_buf[0] == 0x03) return null; // Ctrl-C
+        buf[pos] = byte_buf[0];
+        pos += 1;
+    }
+
+    const trimmed = std.mem.trim(u8, buf[0..pos], " \t");
+    const num = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    if (num < 1 or num > providers.len) return null;
+    return num - 1;
+}
+
 /// Prompt the user to enter an API key interactively (with echo suppressed).
 /// Returns the trimmed key, or null if the user cancels (empty input / Ctrl-C).
 pub fn promptApiKey(allocator: std.mem.Allocator) ?[]const u8 {

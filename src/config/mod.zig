@@ -59,22 +59,59 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
 
     // Check for missing API key (separate from validate for detailed error)
     if (validate.needsApiKey(&resolved)) {
-        auth.printKeyError(
-            resolved.config.provider,
-            resolved.active_provider.key_env_var,
-        );
         // For --dump-config, allow proceeding without key
-        if (!cli_args.dump_config) {
-            // Try interactive prompt
-            if (auth.promptApiKey(arena.allocator())) |key| {
-                auth.saveApiKey(arena.allocator(), resolved.config.provider, key) catch {
-                    io.writeErr("Failed to save API key.\n");
+        if (cli_args.dump_config) {} else {
+            // If no explicit provider was set via CLI/config, offer selection
+            if (cli_args.provider == null) {
+                if (auth.promptProviderSelection()) |idx| {
+                    const selected = presets.all[idx];
+                    // Update resolved config with new provider
+                    resolved.config.provider = selected.name;
+                    resolved.config.model = selected.default_model;
+                    resolved.active_provider = selected;
+                    resolved.resolved_model = selected.default_model;
+                    resolved.completions_url = try std.fmt.allocPrint(
+                        arena.allocator(),
+                        "{s}{s}",
+                        .{ selected.base_url, selected.chat_completions_path },
+                    );
+
+                    // Save provider choice to global config
+                    saveProviderToConfig(arena.allocator(), selected.name) catch {};
+
+                    // If new provider doesn't need a key (e.g. ollama), skip key prompt
+                    if (!selected.requires_key) {
+                        resolved.auth = .{ .api_key = null, .key_source = .none };
+                    } else {
+                        // Re-resolve key for new provider
+                        resolved.auth = try auth.resolveApiKey(
+                            arena.allocator(),
+                            selected.name,
+                            selected.key_env_var,
+                            cli_args.api_key,
+                        );
+                    }
+                } else {
                     return error.ConfigError;
-                };
-                io.writeErr("API key saved to ~/.config/zaica/auth.json\n\n");
-                resolved.auth = .{ .api_key = key, .key_source = .auth_file };
-            } else {
-                return error.ConfigError;
+                }
+            }
+
+            // Still no key? Prompt for it
+            if (resolved.active_provider.requires_key and resolved.auth.api_key == null) {
+                auth.printKeyError(
+                    resolved.config.provider,
+                    resolved.active_provider.key_env_var,
+                );
+                if (auth.promptApiKey(arena.allocator())) |key| {
+                    auth.saveApiKey(arena.allocator(), resolved.config.provider, key) catch {
+                        io.writeErr("Failed to save API key.\n");
+                        return error.ConfigError;
+                    };
+                    io.writeErr("API key saved to ~/.config/zaica/auth.json\n\n");
+                    resolved.auth = .{ .api_key = key, .key_source = .auth_file };
+                } else {
+                    return error.ConfigError;
+                }
             }
         }
     }
@@ -96,6 +133,27 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         .session_id = if (cli_args.session_id) |s| try arena.allocator().dupe(u8, s) else null,
         .arena = arena,
     };
+}
+
+/// Save the chosen provider to ~/.config/zaica/config.json.
+fn saveProviderToConfig(allocator: std.mem.Allocator, provider_name: []const u8) !void {
+    const home = env.getEnv("HOME") orelse return;
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}/.config/zaica", .{home});
+    defer allocator.free(dir_path);
+    const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{dir_path});
+    defer allocator.free(path);
+
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const file = std.fs.createFileAbsolute(path, .{}) catch return error.FileError;
+    defer file.close();
+
+    var buf: [256]u8 = undefined;
+    const content = std.fmt.bufPrint(&buf, "{{\n  \"provider\": \"{s}\"\n}}\n", .{provider_name}) catch return;
+    file.writeAll(content) catch {};
 }
 
 test {
