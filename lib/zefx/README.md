@@ -4,6 +4,15 @@ Reactive state management for Zig, inspired by [Effector](https://effector.dev).
 
 **Event → Store → sample → Effect** — declarative data flow graphs with comptime type safety.
 
+## Why
+
+Zig projects — game engines, TUI tools, embedded firmware, HTTP servers — end up with the same problem: state scattered across structs, manual callback wiring, flags that track "did X happen yet". zefx replaces that with a declarative graph where you describe **what depends on what**, and the engine handles the rest.
+
+- Zero heap allocs at runtime (arena per tick, freed automatically)
+- Comptime type-checked wiring — wrong payload type = compile error, not runtime crash
+- Two-phase flush (pure reducers → effects) — watchers always see consistent state
+- No event loop dependency — works in game loops, TUI poll loops, embedded `while(true)`, or with external I/O (libxev, epoll)
+
 ## Install
 
 ```sh
@@ -45,189 +54,324 @@ pub fn main() !void {
 }
 ```
 
-## JS-like facade
+## Examples
 
-Use `Runtime` for the shortest setup and an Effector-style API:
+### Game HUD — raylib-zig
+
+Managing HUD state in a game loop. Instead of `if (health != prev_health) redraw()` scattered everywhere, declare the graph once:
 
 ```zig
-const std = @import("std");
 const zefx = @import("zefx");
+const rl = @import("raylib");
 
+// ── graph ──────────────────────────────────────
 var rt: zefx.Runtime = undefined;
 rt.init();
 defer rt.deinit();
 const fx = rt.fx();
 
-const inc = fx.createEvent(i32);
-const dec = fx.createEvent(i32);
+const damageTaken = fx.createEvent(i32);
+const healReceived = fx.createEvent(i32);
 
-const count = fx.createStore(i32, 0);
-_ = count.on(inc, &struct { fn plus(s: i32, x: i32) ?i32 { return s + x; } }.plus);
-_ = count.on(dec, &struct { fn minus(s: i32, x: i32) ?i32 { return s - x; } }.minus);
+const $hp = fx.createStore(i32, 100);
+_ = $hp.on(damageTaken, &struct {
+    fn r(hp: i32, dmg: i32) ?i32 { return @max(0, hp - dmg); }
+}.r);
+_ = $hp.on(healReceived, &struct {
+    fn r(hp: i32, heal: i32) ?i32 { return @min(100, hp + heal); }
+}.r);
 
-const doubled = fx.createStore(i32, 0);
+const $alive = fx.createStore(bool, true);
 _ = fx.sample(.{
-    .clock = inc,
-    .source = count,
-    .fn_ = &struct { fn f(v: i32) i32 { return v * 2; } }.f,
-    .target = doubled,
+    .clock  = damageTaken,
+    .source = $hp,
+    .fn_    = &struct { fn f(hp: i32) bool { return hp > 0; } }.f,
+    .target = $alive,
 });
 
-const bigOnly = fx.createStore(i32, 0);
+// only fires when hp drops below 20
+const lowHpWarning = fx.createEvent(i32);
 _ = fx.guard(.{
-    .clock = inc,
-    .source = count,
-    .filter = &struct { fn f(v: i32) bool { return v >= 10; } }.f,
-    .target = bigOnly,
+    .clock  = damageTaken,
+    .source = $hp,
+    .filter = &struct { fn f(hp: i32) bool { return hp > 0 and hp < 20; } }.f,
+    .target = lowHpWarning,
 });
 
-const lastInc = fx.restore(inc, 0);
+// ── game loop ──────────────────────────────────
+while (!rl.windowShouldClose()) {
+    if (rl.isKeyPressed(.key_space)) damageTaken.emit(15);
+    if (rl.isKeyPressed(.key_h)) healReceived.emit(10);
 
-const sub = count.subscribe(&struct {
-    fn w(v: i32) void {
-        std.debug.print("$count = {d}\n", .{v});
+    rl.beginDrawing();
+    // $hp.get(), $alive.get() — always consistent, no stale state
+    drawHealthBar($hp.get(), $alive.get());
+    rl.endDrawing();
+}
+```
+
+No manual dirty flags. The graph guarantees `$alive` and `$hp` are consistent after every emit.
+
+### TUI file browser — libvaxis
+
+Managing filter/sort state in a terminal UI. Instead of re-sorting in the render loop, the graph updates `$visible` only when inputs change:
+
+```zig
+const zefx = @import("zefx");
+const vaxis = @import("vaxis");
+
+var rt: zefx.Runtime = undefined;
+rt.init();
+defer rt.deinit();
+const fx = rt.fx();
+
+const Entry = struct { name: [256]u8 = undefined, name_len: u8 = 0, size: u64 = 0, is_dir: bool = false };
+const Entries = struct { items: [512]Entry = undefined, len: usize = 0 };
+
+const queryChanged = fx.createEvent([256]u8);
+const sortToggled = fx.createEvent(void);
+const dirOpened = fx.createEvent([256]u8);
+
+const $query = fx.restore(queryChanged, [_]u8{0} ** 256);
+const $sort_by_size = fx.createStore(bool, false);
+_ = $sort_by_size.on(sortToggled, &struct {
+    fn r(s: bool, _: void) ?bool { return !s; }
+}.r);
+
+const $entries = fx.createStore(Entries, .{});
+const $visible = fx.createStore(Entries, .{});
+
+// When query or entries change → recompute visible list
+_ = fx.sample(.{
+    .source = .{ .entries = $entries, .query = $query },
+    .fn_ = &struct {
+        fn filter(snap: zefx.shape.SnapshotTypeOf(
+            struct { entries: *zefx.Store(Entries), query: *zefx.Store([256]u8) }
+        )) Entries {
+            var result: Entries = .{};
+            for (snap.entries.items[0..snap.entries.len]) |entry| {
+                if (matchesQuery(entry, snap.query)) {
+                    result.items[result.len] = entry;
+                    result.len += 1;
+                }
+            }
+            return result;
+        }
+    }.filter,
+    .target = $visible,
+});
+
+// readdir effect
+const FsErr = error{AccessDenied};
+const readdirFx = fx.createEffect([256]u8, Entries, FsErr, &readDirectory);
+_ = $entries.on(readdirFx.done, &struct {
+    fn r(_: Entries, d: zefx.Effect([256]u8, Entries, FsErr).DoneData) ?Entries {
+        return d.result;
     }
-}.w);
+}.r);
 
-inc.emit(5); // count=5, doubled=10, guard blocked
-inc.emit(6); // count=11, doubled=22, guard passed (11)
-dec.emit(3); // count=8
+// dirOpened → trigger readdir
+_ = fx.forward(dirOpened, readdirFx); // assumes matching types
 
-count.unsubscribe(sub);
-std.debug.print("doubled={d}, bigOnly={d}, lastInc={d}\n", .{
-    doubled.getState(), bigOnly.getState(), lastInc.getState(),
+// ── vaxis event loop ───────────────────────────
+while (true) {
+    const event = tty.nextEvent();
+    switch (event) {
+        .key_press => |key| switch (key) {
+            '/' => queryChanged.emit(input_buf),
+            's' => sortToggled.emit({}),
+            '\r' => dirOpened.emit(selected_path),
+            'q' => break,
+            else => {},
+        },
+        else => {},
+    }
+    renderFileList($visible.get()); // always filtered + sorted
+}
+```
+
+### HTTP server metrics — httpz (http.zig)
+
+Track request metrics without polluting handler logic. The graph accumulates stats; handlers just emit facts:
+
+```zig
+const zefx = @import("zefx");
+const httpz = @import("httpz");
+
+var rt: zefx.Runtime = undefined;
+rt.init();
+defer rt.deinit();
+const fx = rt.fx();
+
+const ReqInfo = struct { method: u8, path_len: u16, status: u16, latency_us: u64 };
+
+const requestCompleted = fx.createEvent(ReqInfo);
+
+const $total_requests = fx.createStore(u64, 0);
+_ = $total_requests.on(requestCompleted, &struct {
+    fn r(n: u64, _: ReqInfo) ?u64 { return n + 1; }
+}.r);
+
+const $error_count = fx.createStore(u64, 0);
+_ = fx.sample(.{
+    .clock = requestCompleted,
+    .source = $error_count,
+    .fn_ = &struct {
+        // sample fn receives (source_value, clock_payload) when both provided
+        fn f(count: u64) u64 { return count; }
+    }.f,
+    .target = $error_count,
 });
+// simpler: count errors via guard + store
+const errorOccurred = fx.createEvent(ReqInfo);
+_ = fx.guard(.{
+    .clock  = requestCompleted,
+    .filter = &struct { fn f(r: ReqInfo) bool { return r.status >= 500; } }.f,
+    .target = errorOccurred,
+});
+_ = $error_count.on(errorOccurred, &struct {
+    fn r(n: u64, _: ReqInfo) ?u64 { return n + 1; }
+}.r);
+
+// Log slow requests (>100ms) as a side effect
+const slowRequest = fx.createEvent(ReqInfo);
+_ = fx.guard(.{
+    .clock  = requestCompleted,
+    .filter = &struct { fn f(r: ReqInfo) bool { return r.latency_us > 100_000; } }.f,
+    .target = slowRequest,
+});
+_ = slowRequest.watch(&logSlowRequest);
+
+// ── in your httpz handler ──────────────────────
+fn handleRequest(req: *httpz.Request, res: *httpz.Response) void {
+    const start = std.time.microTimestamp();
+    // ... handle ...
+    res.status = 200;
+    requestCompleted.emit(.{
+        .method = req.method,
+        .path_len = @intCast(req.path.len),
+        .status = res.status,
+        .latency_us = @intCast(std.time.microTimestamp() - start),
+    });
+}
+
+// GET /metrics
+fn handleMetrics(_: *httpz.Request, res: *httpz.Response) void {
+    res.json(.{
+        .total = $total_requests.get(),
+        .errors = $error_count.get(),
+    });
+}
 ```
 
-Store and event aliases available:
-- `store.getState()` / `store.setState(v)`
-- `store.subscribe(cb)` / `store.unsubscribe(sub)`
-- `event.subscribe(cb)` / `event.unsubscribe(sub)`
+### Sensor pipeline — MicroZig / embedded
 
-`Runtime` already gives a bound facade (`fx`) so you do not pass `&domain` around:
+Embedded sensor → threshold → actuator. Replace hand-rolled state machines with a declarative graph:
 
 ```zig
-var rt: zefx.Runtime = undefined;
-rt.init();
-defer rt.deinit();
-
-const fx = rt.fx();
-const inc = fx.createEvent(i32);
-const count = fx.createStore(i32, 0);
-_ = count.on(inc, &struct { fn r(s: i32, x: i32) ?i32 { return s + x; } }.r);
-```
-
-Counter example with runtime:
-
-```zig
-var rt: zefx.Runtime = undefined;
-rt.init();
-defer rt.deinit();
-const fx = rt.fx();
-
-const inc = fx.createEvent(i32);
-const dec = fx.createEvent(i32);
-const count = fx.createStore(i32, 0);
-_ = count.on(inc, &struct { fn r(s: i32, p: i32) ?i32 { return s + p; } }.r);
-_ = count.on(dec, &struct { fn r(s: i32, p: i32) ?i32 { return s - p; } }.r);
-
-inc.emit(10);
-dec.emit(3);
-// count.getState() == 7
-```
-
-## Effector-style todo model example
-
-```zig
-const std = @import("std");
 const zefx = @import("zefx");
 
-const Todo = struct { id: u32, done: bool };
-const Todos = struct {
-    items: [64]Todo = undefined,
-    len: usize = 0,
-};
+var rt: zefx.Runtime = undefined;
+rt.init();
+defer rt.deinit();
+const fx = rt.fx();
+
+const SensorReading = struct { temp_c: i16, humidity: u8 };
+
+const sensorTick = fx.createEvent(SensorReading);
+
+const $temperature = fx.createStore(i16, 0);
+_ = $temperature.on(sensorTick, &struct {
+    fn r(_: i16, s: SensorReading) ?i16 { return s.temp_c; }
+}.r);
+
+const $humidity = fx.createStore(u8, 0);
+_ = $humidity.on(sensorTick, &struct {
+    fn r(_: u8, s: SensorReading) ?u8 { return s.humidity; }
+}.r);
+
+// Overheat alarm — only fires when crossing threshold
+const overheatDetected = fx.createEvent(i16);
+_ = fx.guard(.{
+    .clock  = sensorTick,
+    .source = $temperature,
+    .filter = &struct { fn f(t: i16) bool { return t > 80; } }.f,
+    .target = overheatDetected,
+});
+
+// Fan control: on when temp > 60, off when <= 60
+const $fan_on = fx.createStore(bool, false);
+_ = fx.sample(.{
+    .clock  = sensorTick,
+    .source = $temperature,
+    .fn_    = &struct { fn f(t: i16) bool { return t > 60; } }.f,
+    .target = $fan_on,
+});
+
+// Wire to hardware via watchers
+_ = $fan_on.watch(&setFanGpio);
+_ = overheatDetected.watch(&triggerBuzzer);
+
+// ── main loop (bare metal / RTOS) ─────────────
+while (true) {
+    const reading = readSensorI2C();
+    sensorTick.emit(reading);
+    // fan GPIO and buzzer are updated automatically by the graph
+    busyWait(100_000); // 100ms
+}
+```
+
+No `if (temp > 80 and !alarm_active)` scattered across the codebase. The graph handles all derived state.
+
+### Event loop integration — libxev
+
+zefx is synchronous — it doesn't own an event loop. When using libxev (or epoll/kqueue directly), the pattern is: I/O completes → emit event → graph reacts:
+
+```zig
+const zefx = @import("zefx");
+const xev = @import("xev");
 
 var rt: zefx.Runtime = undefined;
 rt.init();
 defer rt.deinit();
 const fx = rt.fx();
 
-const addTodo = fx.createEvent(u32);
-const toggleTodo = fx.createEvent(u32);
-const removeTodo = fx.createEvent(u32);
+const ConnEvent = struct { fd: i32, bytes: usize };
 
-const $todos = fx.createStore(Todos, .{});
-const $total = fx.createStore(usize, 0);
-const $completed = fx.createStore(usize, 0);
+const dataReceived = fx.createEvent(ConnEvent);
+const connectionClosed = fx.createEvent(i32);
 
-_ = $todos.on(addTodo, &struct {
-    fn r(state: Todos, id: u32) ?Todos {
-        if (state.len >= state.items.len) return state;
-        var next = state;
-        next.items[next.len] = .{ .id = id, .done = false };
-        next.len += 1;
-        return next;
-    }
+const $active_conns = fx.createStore(u32, 0);
+_ = $active_conns.on(dataReceived, &struct {
+    fn r(n: u32, _: ConnEvent) ?u32 { return n; } // no-op, just tracking
 }.r);
-_ = $todos.on(toggleTodo, &struct {
-    fn r(state: Todos, id: u32) ?Todos {
-        var next = state;
-        var i: usize = 0;
-        while (i < next.len) : (i += 1) {
-            if (next.items[i].id == id) {
-                next.items[i].done = !next.items[i].done;
-                break;
-            }
-        }
-        return next;
-    }
-}.r);
-_ = $todos.on(removeTodo, &struct {
-    fn r(state: Todos, id: u32) ?Todos {
-        var next = state;
-        var i: usize = 0;
-        while (i < next.len) : (i += 1) {
-            if (next.items[i].id == id) {
-                var j = i;
-                while (j + 1 < next.len) : (j += 1) {
-                    next.items[j] = next.items[j + 1];
-                }
-                next.len -= 1;
-                break;
-            }
-        }
-        return next;
-    }
+_ = $active_conns.on(connectionClosed, &struct {
+    fn r(n: u32, _: i32) ?u32 { return if (n > 0) n - 1 else 0; }
 }.r);
 
-_ = fx.sample(.{
-    .source = $todos,
-    .fn_ = &struct { fn f(s: Todos) usize { return s.len; } }.f,
-    .target = $total,
-});
-_ = fx.sample(.{
-    .source = $todos,
-    .fn_ = &struct {
-        fn f(s: Todos) usize {
-            var done: usize = 0;
-            var i: usize = 0;
-            while (i < s.len) : (i += 1) if (s.items[i].done) done += 1;
-            return done;
-        }
-    }.f,
-    .target = $completed,
-});
+const $bytes_total = fx.createStore(u64, 0);
+_ = $bytes_total.on(dataReceived, &struct {
+    fn r(total: u64, ev: ConnEvent) ?u64 { return total + ev.bytes; }
+}.r);
 
-addTodo.emit(1);
-addTodo.emit(2);
-toggleTodo.emit(1);
-removeTodo.emit(2);
+// ── libxev callback ────────────────────────────
+fn onRead(userdata: ?*anyopaque, result: xev.ReadError!usize) void {
+    _ = userdata;
+    const n = result catch {
+        connectionClosed.emit(fd);
+        return;
+    };
+    dataReceived.emit(.{ .fd = fd, .bytes = n });
+    // $bytes_total, $active_conns updated synchronously — no race conditions
+}
 
-std.debug.print("total={d}, completed={d}\n", .{
-    $total.getState(), $completed.getState(),
-});
+// Run libxev event loop
+var loop = try xev.Loop.init(.{});
+defer loop.deinit();
+loop.run();
 ```
+
+zefx runs inside the callback — fully synchronous, no thread safety issues, no async/await.
 
 ## API
 
@@ -235,124 +379,53 @@ std.debug.print("total={d}, completed={d}\n", .{
 
 | Primitive | Description |
 |-----------|-------------|
-| `Runtime` | Owns allocator + domain lifecycle. Use `rt.init()` / `rt.deinit()` |
-| `Engine` | Owns the reactive graph. Two-phase flush: pure reducers → effect watchers |
-| `Event(T)` | A signal carrying payload `T`. Emit to trigger the graph |
-| `Store(T)` | Holds state `T`. Updated by `.on(event, reducer)` or `.set(value)` |
+| `Runtime` | Owns allocator + domain lifecycle. `rt.init()` / `rt.deinit()` |
+| `Event(T)` | Signal carrying payload `T`. `.emit(value)` triggers the graph |
+| `Store(T)` | Holds state `T`. `.on(event, reducer)` or `.set(value)` |
+| `Effect(P,R,E)` | Wraps `fn(P) E!R`. Derived: `.done`, `.fail`, `.finally_`, `.pending` |
 
 ### Operators
 
-#### `sample` — connect clock, source, transform, target
+| Operator | Description |
+|----------|-------------|
+| `sample(.{clock, source, fn_, target})` | When clock fires → snapshot source → transform → push to target |
+| `guard(.{clock, source, filter, target})` | Like sample, but only passes when filter returns `true` |
+| `forward(from, to)` | Pipe one unit to another (sugar over sample) |
+| `restore(event, initial)` | Create a store that holds the last value from an event |
 
-When `clock` fires, snapshot `source`, apply `fn_`, push result to `target`.
-
-```zig
-// setup once
-var rt: zefx.Runtime = undefined;
-rt.init();
-defer rt.deinit();
-const fx = rt.fx();
-
-const clicked = fx.createEvent(i32);
-const count = fx.createStore(i32, 0);
-const doubled_ev = fx.createEvent(i32);
-
-// clock fires -> read count -> double it -> push to doubled_ev
-_ = fx.sample(.{
-    .clock  = clicked,
-    .source = count,
-    .fn_    = &struct {
-        fn f(src: i32) i32 { return src * 2; }
-    }.f,
-    .target = doubled_ev,
-});
-```
-
-Target can be an `Event` or a `Store`. If omitted, `sample` auto-creates and returns a new `*Event(R)`:
+### createEffect
 
 ```zig
-const squared = fx.sample(.{
-    .clock  = clicked,
-    .source = count,
-    .fn_    = &struct {
-        fn f(src: i32) i32 { return src * src; }
-    }.f,
-});
-_ = squared.watch(&struct {
-    fn log(v: i32) void { _ = v; }
-}.log);
-```
+const FxErr = error{Timeout};
+const fetchFx = fx.createEffect(Request, Response, FxErr, &handler);
 
-#### `guard` — conditional pass-through
-
-Like `sample`, but with a `filter` instead of `fn_`. Only passes values where filter returns `true`:
-
-```zig
-const big_values_ev = fx.createEvent(i32);
-_ = fx.guard(.{
-    .clock  = clicked,
-    .source = count,
-    .filter = &struct {
-        fn f(v: i32) bool { return v > 5; }
-    }.f,
-    .target = big_values_ev,
-});
-```
-
-#### `sample` with shape source
-
-Combine multiple stores into a single snapshot:
-
-```zig
-const other = fx.createStore(i32, 10);
-const sum_ev = fx.createEvent(i32);
-_ = fx.sample(.{
-    .clock  = clicked,
-    .source = .{ .a = count, .b = other },
-    .fn_    = &struct {
-        fn f(snap: zefx.shape.SnapshotTypeOf(
-            struct { a: *zefx.Store(i32), b: *zefx.Store(i32) }
-        )) i32 {
-            return snap.a + snap.b;
-        }
-    }.f,
-    .target = sum_ev,
-});
-```
-
-#### `forward` — pipe one unit to another
-
-```zig
-const source_event = fx.createEvent(i32);
-const target_event = fx.createEvent(i32);
-_ = fx.forward(source_event, target_event);
-```
-
-#### `restore` — create a store from an event
-
-```zig
-const $last = fx.restore(clicked, 0);
-// $last always holds the most recent value emitted by `clicked`
+fetchFx.run(params);         // schedule handler in effects phase
+fetchFx.done                 // *Event(DoneData) — emitted on success
+fetchFx.fail                 // *Event(FailData) — emitted on error
+fetchFx.finally_             // *Event(FinallyData) — emitted always
+fetchFx.pending              // *Store(bool) — true while running
 ```
 
 ### Factory constructors
 
-Runtime/domain-managed allocation (auto-freed on `rt.deinit()`):
+All units are heap-allocated and auto-freed on `rt.deinit()`:
 
 ```zig
 const ev = fx.createEvent(i32);
 const st = fx.createStore(i32, 0);
+const ef = fx.createEffect(i32, i32, error{Fail}, &handler);
 ```
 
 ## Execution model
 
 1. `event.emit(payload)` schedules reducer thunks (pure) and watcher thunks (effects)
 2. Engine flushes in two phases:
-   - **Phase 1**: all pure reducers run, stores update, derived samples fire
-   - **Phase 2**: all effect watchers run
-3. If no flush is in progress, `emit` auto-flushes immediately
+   - **Phase 1 (pure)**: reducers run, stores update, derived samples fire
+   - **Phase 2 (effects)**: watchers run, effects execute — may emit new events
+3. If effects emit events, the loop repeats until stable
+4. If no flush is in progress, `emit` auto-flushes immediately
 
-This guarantees consistent state snapshots — watchers always see the final state of the current tick.
+Watchers always see the final consistent state of the current tick.
 
 ## Run the demo
 

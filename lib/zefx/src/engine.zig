@@ -68,34 +68,42 @@ pub const Engine = struct {
     }
 
     pub fn flush(self: *Engine) void {
-        // Phase 1: pure — drain reducers (may enqueue more)
-        self.phase = .pure;
-        while (self.pure_queue.items.len > 0) {
-            const len = self.pure_queue.items.len;
-            const copy = self.allocator.alloc(Thunk, len) catch @panic("OOM");
-            defer self.allocator.free(copy);
-            @memcpy(copy, self.pure_queue.items[0..len]);
-            self.pure_queue.items.len = 0;
-            for (copy) |t| t.invoke();
-        }
+        // Drain until stable. Effects may emit new events, which enqueue new
+        // pure reducers that must run before ending the tick/resetting arena.
+        while (true) {
+            // Phase 1: pure — drain reducers (may enqueue more)
+            self.phase = .pure;
+            while (self.pure_queue.items.len > 0) {
+                const len = self.pure_queue.items.len;
+                const copy = self.allocator.alloc(Thunk, len) catch @panic("OOM");
+                defer self.allocator.free(copy);
+                @memcpy(copy, self.pure_queue.items[0..len]);
+                self.pure_queue.items.len = 0;
+                for (copy) |t| t.invoke();
+            }
 
-        // Phase 2: effects
-        self.phase = .effects;
-        // 2a: dirty store watchers
-        for (self.dirty_indices.items) |idx| {
-            const n = self.store_notifiers.items[idx];
-            n.notifyFn(n.ctx);
-        }
-        self.dirty_indices.clearRetainingCapacity();
+            // Phase 2: effects
+            self.phase = .effects;
+            // 2a: dirty store watchers
+            for (self.dirty_indices.items) |idx| {
+                const n = self.store_notifiers.items[idx];
+                n.notifyFn(n.ctx);
+            }
+            self.dirty_indices.clearRetainingCapacity();
 
-        // 2b: event watchers / scheduled effects
-        while (self.effect_queue.items.len > 0) {
-            const len = self.effect_queue.items.len;
-            const copy = self.allocator.alloc(Thunk, len) catch @panic("OOM");
-            defer self.allocator.free(copy);
-            @memcpy(copy, self.effect_queue.items[0..len]);
-            self.effect_queue.items.len = 0;
-            for (copy) |t| t.invoke();
+            // 2b: event watchers / scheduled effects
+            while (self.effect_queue.items.len > 0) {
+                const len = self.effect_queue.items.len;
+                const copy = self.allocator.alloc(Thunk, len) catch @panic("OOM");
+                defer self.allocator.free(copy);
+                @memcpy(copy, self.effect_queue.items[0..len]);
+                self.effect_queue.items.len = 0;
+                for (copy) |t| t.invoke();
+            }
+
+            if (self.pure_queue.items.len == 0 and self.effect_queue.items.len == 0 and self.dirty_indices.items.len == 0) {
+                break;
+            }
         }
 
         // Reset per-tick arena, advance tick

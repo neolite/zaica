@@ -2,6 +2,7 @@ const std = @import("std");
 const event_mod = @import("event.zig");
 const store_mod = @import("store.zig");
 const sample_mod = @import("sample.zig");
+const effect_mod = @import("effect.zig");
 
 pub const Engine = @import("engine.zig").Engine;
 pub const Thunk = @import("engine.zig").Thunk;
@@ -9,6 +10,7 @@ pub const Subscription = @import("engine.zig").Subscription;
 pub const Phase = @import("engine.zig").Phase;
 pub const Event = event_mod.Event;
 pub const Store = store_mod.Store;
+pub const Effect = effect_mod.Effect;
 pub const shape = @import("shape.zig");
 pub const sample = sample_mod.sample;
 pub const guard = sample_mod.guard;
@@ -63,6 +65,26 @@ pub const BoundDomain = struct {
         return sample_mod.sample(&self.domain.eng, .{ .clock = from, .source = from, .target = to });
     }
 
+    pub fn effect(self: BoundDomain, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+        return allocEffect(&self.domain.eng, Params, Result, ErrSet, handler);
+    }
+
+    pub fn createEffect(self: BoundDomain, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+        return self.effect(Params, Result, ErrSet, handler);
+    }
+
+    pub fn merge_(self: BoundDomain, sources: anytype) @TypeOf(merge(&self.domain.eng, sources)) {
+        return merge(&self.domain.eng, sources);
+    }
+
+    pub fn split(self: BoundDomain, source: anytype, cases: anytype) @TypeOf(split_(&self.domain.eng, source, cases)) {
+        return split_(&self.domain.eng, source, cases);
+    }
+
+    pub fn combine_(self: BoundDomain, stores: anytype, combineFn: anytype) @TypeOf(combine(&self.domain.eng, stores, combineFn)) {
+        return combine(&self.domain.eng, stores, combineFn);
+    }
+
     pub fn restore(self: BoundDomain, ev: anytype, initial: @typeInfo(@TypeOf(ev)).pointer.child.Payload) *Store(@typeInfo(@TypeOf(ev)).pointer.child.Payload) {
         const T = @typeInfo(@TypeOf(ev)).pointer.child.Payload;
         const st = allocStore(&self.domain.eng, T, initial);
@@ -90,7 +112,7 @@ fn allocEvent(eng: *Engine, comptime T: type) *Event(T) {
 
 fn allocStore(eng: *Engine, comptime T: type, initial: T) *Store(T) {
     const st = eng.allocator.create(Store(T)) catch @panic("OOM");
-    st.* = .{ .eng = eng, .value = initial, .prev = initial };
+    st.* = .{ .eng = eng, .value = initial, .prev = initial, .initial = initial };
     eng.trackGraphAlloc(@ptrCast(st), &struct {
         fn dtor(a: @import("std").mem.Allocator, p: *anyopaque) void {
             const s: *Store(T) = @ptrCast(@alignCast(p));
@@ -99,6 +121,48 @@ fn allocStore(eng: *Engine, comptime T: type, initial: T) *Store(T) {
         }
     }.dtor);
     return st;
+}
+
+fn allocEffect(eng: *Engine, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+    const E = Effect(Params, Result, ErrSet);
+    const DoneData = E.DoneData;
+    const FailData = E.FailData;
+
+    const fx = eng.allocator.create(E) catch @panic("OOM");
+    const done = allocEvent(eng, DoneData);
+    const fail = allocEvent(eng, FailData);
+    const finally_ = allocEvent(eng, E.FinallyData);
+    const pending = allocStore(eng, bool, false);
+
+    // pending = false on done or fail
+    _ = pending.on(done, &struct {
+        fn reduce(_: bool, _: DoneData) ?bool {
+            return false;
+        }
+    }.reduce);
+    _ = pending.on(fail, &struct {
+        fn reduce(_: bool, _: FailData) ?bool {
+            return false;
+        }
+    }.reduce);
+
+    fx.* = .{
+        .eng = eng,
+        .handler = handler,
+        .done = done,
+        .fail = fail,
+        .finally_ = finally_,
+        .pending = pending,
+    };
+
+    eng.trackGraphAlloc(@ptrCast(fx), &struct {
+        fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+            const e: *E = @ptrCast(@alignCast(p));
+            e.deinit();
+            a.destroy(e);
+        }
+    }.dtor);
+    return fx;
 }
 
 pub const App = struct {
@@ -140,6 +204,26 @@ pub const App = struct {
         return sample_mod.sample(&self.eng, .{ .clock = from, .source = from, .target = to });
     }
 
+    pub fn effect(self: *App, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+        return allocEffect(&self.eng, Params, Result, ErrSet, handler);
+    }
+
+    pub fn createEffect(self: *App, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+        return self.effect(Params, Result, ErrSet, handler);
+    }
+
+    pub fn merge_(self: *App, sources: anytype) @TypeOf(merge(&self.eng, sources)) {
+        return merge(&self.eng, sources);
+    }
+
+    pub fn split(self: *App, source: anytype, cases: anytype) @TypeOf(split_(&self.eng, source, cases)) {
+        return split_(&self.eng, source, cases);
+    }
+
+    pub fn combine_(self: *App, stores: anytype, combineFn: anytype) @TypeOf(combine(&self.eng, stores, combineFn)) {
+        return combine(&self.eng, stores, combineFn);
+    }
+
     pub fn restore(self: *App, ev: anytype, initial: @typeInfo(@TypeOf(ev)).pointer.child.Payload) *Store(@typeInfo(@TypeOf(ev)).pointer.child.Payload) {
         const T = @typeInfo(@TypeOf(ev)).pointer.child.Payload;
         const st = allocStore(&self.eng, T, initial);
@@ -176,6 +260,10 @@ pub fn createStore(eng: *Engine, comptime T: type, initial: T) *Store(T) {
     return allocStore(eng, T, initial);
 }
 
+pub fn createEffect_(eng: *Engine, comptime Params: type, comptime Result: type, comptime ErrSet: type, handler: *const fn (Params) ErrSet!Result) *Effect(Params, Result, ErrSet) {
+    return allocEffect(eng, Params, Result, ErrSet, handler);
+}
+
 // ─────────────────────────────────────────────
 // forward(from, to) — sugar (deprecated in v23, use sample)
 // ─────────────────────────────────────────────
@@ -197,6 +285,175 @@ pub fn restore(eng: *Engine, ev: anytype, initial: @typeInfo(@TypeOf(ev)).pointe
         }
     }.reduce);
     return st;
+}
+
+// ─────────────────────────────────────────────
+// merge(.{ev1, ev2, ...}) → *Event(T)
+// ─────────────────────────────────────────────
+
+pub fn merge(eng: *Engine, sources: anytype) *Event(@typeInfo(@typeInfo(@TypeOf(sources)).@"struct".fields[0].type).pointer.child.Payload) {
+    const T = @typeInfo(@typeInfo(@TypeOf(sources)).@"struct".fields[0].type).pointer.child.Payload;
+    const target = allocEvent(eng, T);
+    const fields = @typeInfo(@TypeOf(sources)).@"struct".fields;
+    inline for (fields) |f| {
+        const src = @field(sources, f.name);
+        const FwdCtx = struct { tgt: *Event(T) };
+        const ctx = eng.allocator.create(FwdCtx) catch @panic("OOM");
+        ctx.* = .{ .tgt = target };
+        eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+            fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                const c: *FwdCtx = @ptrCast(@alignCast(p));
+                a.destroy(c);
+            }
+        }.dtor);
+        src.reducers.append(eng.allocator, .{
+            .ctx = @ptrCast(ctx),
+            .trigger = &struct {
+                fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
+                    const c: *FwdCtx = @ptrCast(@alignCast(raw));
+                    const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+                    c.tgt.emit(payload.*);
+                }
+            }.trigger,
+        }) catch @panic("OOM");
+    }
+    return target;
+}
+
+// ─────────────────────────────────────────────
+// split(source, .{.case = filterFn, ...}) → .{.case = *Event(T), ...}
+// ─────────────────────────────────────────────
+
+pub fn split_(eng: *Engine, source: anytype, cases: anytype) SplitResult(@TypeOf(source.*).Payload, @TypeOf(cases)) {
+    return SplitHelper(@TypeOf(source.*).Payload, @TypeOf(cases)).create(eng, source, cases);
+}
+
+fn SplitHelper(comptime T: type, comptime Cases: type) type {
+    return struct {
+        const Result = SplitResult(T, Cases);
+        const case_fields = @typeInfo(Cases).@"struct".fields;
+
+        const SplitCtx = struct {
+            result: Result,
+            cases: Cases,
+        };
+
+        fn create(eng: *Engine, source: anytype, cases: Cases) Result {
+            var result: Result = undefined;
+            inline for (case_fields) |f| {
+                @field(result, f.name) = allocEvent(eng, T);
+            }
+
+            const ctx = eng.allocator.create(SplitCtx) catch @panic("OOM");
+            ctx.* = .{ .result = result, .cases = cases };
+            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const c: *SplitCtx = @ptrCast(@alignCast(p));
+                    a.destroy(c);
+                }
+            }.dtor);
+
+            source.reducers.append(eng.allocator, .{
+                .ctx = @ptrCast(ctx),
+                .trigger = &triggerFn,
+            }) catch @panic("OOM");
+
+            return result;
+        }
+
+        fn triggerFn(raw: *anyopaque, payload_ptr: *const anyopaque) void {
+            const c: *SplitCtx = @ptrCast(@alignCast(raw));
+            const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+            inline for (case_fields) |f| {
+                const filterFn = @field(c.cases, f.name);
+                if (filterFn(payload.*)) {
+                    @field(c.result, f.name).emit(payload.*);
+                }
+            }
+        }
+    };
+}
+
+fn SplitResult(comptime T: type, comptime Cases: type) type {
+    const case_fields = @typeInfo(Cases).@"struct".fields;
+    var fields: [case_fields.len]std.builtin.Type.StructField = undefined;
+    inline for (case_fields, 0..) |f, i| {
+        fields[i] = .{
+            .name = f.name,
+            .type = *Event(T),
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = @alignOf(*Event(T)),
+        };
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
+}
+
+// ─────────────────────────────────────────────
+// combine(.{.a = $a, .b = $b}, combineFn) → *Store(R)
+// ─────────────────────────────────────────────
+
+pub fn combine(eng: *Engine, stores: anytype, combineFn: anytype) *Store(CombineResultType(@TypeOf(combineFn))) {
+    return CombineHelper(@TypeOf(stores), @TypeOf(combineFn)).create(eng, stores, combineFn);
+}
+
+fn CombineResultType(comptime FnType: type) type {
+    const fn_info = @typeInfo(@typeInfo(FnType).pointer.child).@"fn";
+    return fn_info.return_type.?;
+}
+
+fn CombineHelper(comptime Shape: type, comptime FnType: type) type {
+    const R = CombineResultType(FnType);
+    return struct {
+        const CombineCtx = struct {
+            derived_store: *Store(R),
+            shape_stores: Shape,
+            combineFn: FnType,
+        };
+
+        fn create(eng: *Engine, stores: Shape, combineFn: FnType) *Store(R) {
+            const snap = shape.readSnapshot(stores);
+            const init_val = combineFn(snap);
+            const derived = allocStore(eng, R, init_val);
+            derived.ensureRegistered();
+
+            const store_fields = @typeInfo(Shape).@"struct".fields;
+            inline for (store_fields) |f| {
+                const src_store = @field(stores, f.name);
+                src_store.ensureRegistered();
+
+                const ctx = eng.allocator.create(CombineCtx) catch @panic("OOM");
+                ctx.* = .{ .derived_store = derived, .shape_stores = stores, .combineFn = combineFn };
+                eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+                    fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                        const c: *CombineCtx = @ptrCast(@alignCast(p));
+                        a.destroy(c);
+                    }
+                }.dtor);
+
+                src_store.updates().reducers.append(eng.allocator, .{
+                    .ctx = @ptrCast(ctx),
+                    .trigger = &triggerFn,
+                }) catch @panic("OOM");
+            }
+
+            return derived;
+        }
+
+        fn triggerFn(raw: *anyopaque, _: *const anyopaque) void {
+            const c: *CombineCtx = @ptrCast(@alignCast(raw));
+            const new_snap = shape.readSnapshot(c.shape_stores);
+            const new_val = c.combineFn(new_snap);
+            c.derived_store.prev = c.derived_store.value;
+            c.derived_store.value = new_val;
+            c.derived_store.markDirty();
+        }
+    };
 }
 
 test "store.on applies reducer for each event emit" {
@@ -439,6 +696,44 @@ test "effects phase sees final derived state from pure phase" {
     try std.testing.expectEqual(@as(i32, 6), PhaseCheck.seen_tripled);
 }
 
+test "emit from watcher during effects is applied in same tick" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const inc = createEvent(&eng, i32);
+    const mirrored_ev = createEvent(&eng, i32);
+    const count = createStore(&eng, i32, 0);
+    const mirrored = createStore(&eng, i32, 0);
+
+    _ = count.on(inc, &struct {
+        fn reduce(state: i32, payload: i32) ?i32 {
+            return state + payload;
+        }
+    }.reduce);
+    _ = mirrored.on(mirrored_ev, &struct {
+        fn reduce(_: i32, payload: i32) ?i32 {
+            return payload;
+        }
+    }.reduce);
+
+    const Relay = struct {
+        var ev_ptr: ?*Event(i32) = null;
+        fn onCount(v: i32) void {
+            ev_ptr.?.emit(v);
+        }
+    };
+    Relay.ev_ptr = mirrored_ev;
+    _ = count.watch(&Relay.onCount);
+
+    inc.emit(1);
+    try std.testing.expectEqual(@as(i32, 1), count.getState());
+    try std.testing.expectEqual(@as(i32, 1), mirrored.getState());
+
+    inc.emit(2);
+    try std.testing.expectEqual(@as(i32, 3), count.getState());
+    try std.testing.expectEqual(@as(i32, 3), mirrored.getState());
+}
+
 test "stress: many emits keep logic stable" {
     var eng = Engine.init(std.testing.allocator);
     defer eng.deinit();
@@ -621,4 +916,280 @@ test "runtime wrapper supports counter flow" {
     try std.testing.expectEqual(@as(i32, 8), count.getState());
     try std.testing.expectEqual(@as(usize, 2), Probe.calls);
     try std.testing.expectEqual(@as(i32, 8), Probe.last);
+}
+
+test "effect success path emits done and sets pending" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const FxErr = error{Boom};
+    const fetchFx = app.effect(i32, i32, FxErr, &struct {
+        fn handler(params: i32) FxErr!i32 {
+            return params * 10;
+        }
+    }.handler);
+
+    const DoneProbe = struct {
+        var last_result: i32 = -1;
+        var last_params: i32 = -1;
+        fn watch(d: Effect(i32, i32, FxErr).DoneData) void {
+            last_result = d.result;
+            last_params = d.params;
+        }
+    };
+    DoneProbe.last_result = -1;
+    DoneProbe.last_params = -1;
+    _ = fetchFx.done.watch(&DoneProbe.watch);
+
+    fetchFx.run(5);
+
+    try std.testing.expectEqual(@as(i32, 50), DoneProbe.last_result);
+    try std.testing.expectEqual(@as(i32, 5), DoneProbe.last_params);
+    try std.testing.expectEqual(false, fetchFx.pending.get());
+}
+
+test "effect error path emits fail" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const FxErr = error{Boom};
+    const fetchFx = app.effect(i32, i32, FxErr, &struct {
+        fn handler(_: i32) FxErr!i32 {
+            return error.Boom;
+        }
+    }.handler);
+
+    const FailProbe = struct {
+        var got_err: bool = false;
+        var last_params: i32 = -1;
+        fn watch(d: Effect(i32, i32, FxErr).FailData) void {
+            got_err = (d.err == error.Boom);
+            last_params = d.params;
+        }
+    };
+    FailProbe.got_err = false;
+    FailProbe.last_params = -1;
+    _ = fetchFx.fail.watch(&FailProbe.watch);
+
+    fetchFx.run(3);
+
+    try std.testing.expect(FailProbe.got_err);
+    try std.testing.expectEqual(@as(i32, 3), FailProbe.last_params);
+    try std.testing.expectEqual(false, fetchFx.pending.get());
+}
+
+test "effect pending store is false after completion" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const FxErr = error{Oops};
+    const fx = app.effect(i32, i32, FxErr, &struct {
+        fn handler(p: i32) FxErr!i32 {
+            return p;
+        }
+    }.handler);
+
+    // Before run, pending is false
+    try std.testing.expectEqual(false, fx.pending.get());
+
+    fx.run(1);
+
+    // After synchronous effect completes, pending settles to false
+    try std.testing.expectEqual(false, fx.pending.get());
+}
+
+test "sample with effect.done as clock" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const FxErr = error{Nope};
+    const fetchFx = app.effect(i32, i32, FxErr, &struct {
+        fn handler(p: i32) FxErr!i32 {
+            return p + 1;
+        }
+    }.handler);
+
+    const results = app.store(i32, 0);
+    _ = results.on(fetchFx.done, &struct {
+        fn reduce(_: i32, d: Effect(i32, i32, FxErr).DoneData) ?i32 {
+            return d.result;
+        }
+    }.reduce);
+
+    fetchFx.run(9);
+    try std.testing.expectEqual(@as(i32, 10), results.get());
+
+    fetchFx.run(19);
+    try std.testing.expectEqual(@as(i32, 20), results.get());
+}
+
+// ─────────────────────────────────────────────
+// Tests for new operators
+// ─────────────────────────────────────────────
+
+test "store.reset restores initial value on event" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const inc = app.event(i32);
+    const rst = app.event(void);
+    const count = app.store(i32, 0);
+
+    _ = count.on(inc, &struct {
+        fn reduce(state: i32, payload: i32) ?i32 {
+            return state + payload;
+        }
+    }.reduce);
+    _ = count.reset(rst);
+
+    inc.emit(5);
+    inc.emit(3);
+    try std.testing.expectEqual(@as(i32, 8), count.get());
+
+    rst.emit({});
+    try std.testing.expectEqual(@as(i32, 0), count.get());
+
+    inc.emit(2);
+    try std.testing.expectEqual(@as(i32, 2), count.get());
+}
+
+test "store.map derives a new store" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const inc = app.event(i32);
+    const count = app.store(i32, 1);
+    _ = count.on(inc, &struct {
+        fn reduce(state: i32, payload: i32) ?i32 {
+            return state + payload;
+        }
+    }.reduce);
+
+    const doubled = count.map(i32, &struct {
+        fn m(v: i32) i32 {
+            return v * 2;
+        }
+    }.m);
+
+    try std.testing.expectEqual(@as(i32, 2), doubled.get()); // initial mapped
+
+    inc.emit(4); // count=5, doubled=10
+    try std.testing.expectEqual(@as(i32, 5), count.get());
+    try std.testing.expectEqual(@as(i32, 10), doubled.get());
+}
+
+test "event.map transforms payload" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const src = app.event(i32);
+    const doubled = src.map(i32, &struct {
+        fn m(v: i32) i32 {
+            return v * 2;
+        }
+    }.m);
+
+    const last = restore(&app.eng, doubled, 0);
+
+    src.emit(5);
+    try std.testing.expectEqual(@as(i32, 10), last.get());
+
+    src.emit(3);
+    try std.testing.expectEqual(@as(i32, 6), last.get());
+}
+
+test "event.filter only passes matching payloads" {
+    var app = createApp(std.testing.allocator);
+    defer app.deinit();
+
+    const src = app.event(i32);
+    const positive = src.filter(&struct {
+        fn f(v: i32) bool {
+            return v > 0;
+        }
+    }.f);
+
+    const last = restore(&app.eng, positive, 0);
+
+    src.emit(-1);
+    try std.testing.expectEqual(@as(i32, 0), last.get());
+
+    src.emit(5);
+    try std.testing.expectEqual(@as(i32, 5), last.get());
+
+    src.emit(-3);
+    try std.testing.expectEqual(@as(i32, 5), last.get());
+}
+
+test "merge combines multiple events into one" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const a = createEvent(&eng, i32);
+    const b = createEvent(&eng, i32);
+    const c = createEvent(&eng, i32);
+
+    const merged = merge(&eng, .{ a, b, c });
+    const last = restore(&eng, merged, 0);
+
+    a.emit(1);
+    try std.testing.expectEqual(@as(i32, 1), last.get());
+
+    b.emit(2);
+    try std.testing.expectEqual(@as(i32, 2), last.get());
+
+    c.emit(3);
+    try std.testing.expectEqual(@as(i32, 3), last.get());
+}
+
+test "split routes event to matching cases" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const src = createEvent(&eng, i32);
+    const cases = split_(&eng, src, .{
+        .positive = &struct {
+            fn f(v: i32) bool {
+                return v > 0;
+            }
+        }.f,
+        .negative = &struct {
+            fn f(v: i32) bool {
+                return v < 0;
+            }
+        }.f,
+    });
+
+    const last_pos = restore(&eng, cases.positive, 0);
+    const last_neg = restore(&eng, cases.negative, 0);
+
+    src.emit(5);
+    try std.testing.expectEqual(@as(i32, 5), last_pos.get());
+    try std.testing.expectEqual(@as(i32, 0), last_neg.get());
+
+    src.emit(-3);
+    try std.testing.expectEqual(@as(i32, 5), last_pos.get());
+    try std.testing.expectEqual(@as(i32, -3), last_neg.get());
+}
+
+test "combine derives store from multiple source stores" {
+    var eng = Engine.init(std.testing.allocator);
+    defer eng.deinit();
+
+    const a = createStore(&eng, i32, 1);
+    const b = createStore(&eng, i32, 2);
+
+    const sum = combine(&eng, .{ .a = a, .b = b }, &struct {
+        fn calc(snap: shape.SnapshotTypeOf(struct { a: *Store(i32), b: *Store(i32) })) i32 {
+            return snap.a + snap.b;
+        }
+    }.calc);
+
+    try std.testing.expectEqual(@as(i32, 3), sum.get()); // initial
+
+    a.set(5);
+    try std.testing.expectEqual(@as(i32, 7), sum.get());
+
+    b.set(10);
+    try std.testing.expectEqual(@as(i32, 15), sum.get());
 }

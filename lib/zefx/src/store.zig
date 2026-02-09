@@ -20,6 +20,7 @@ pub fn Store(comptime T: type) type {
         name_: []const u8 = "",
         value: T,
         prev: T,
+        initial: T,
         dirty: bool = false,
         last_dirty_tick: u32 = 0,
         store_index: ?usize = null,
@@ -138,7 +139,53 @@ pub fn Store(comptime T: type) type {
             return self;
         }
 
-        fn ensureRegistered(self: *Self) void {
+        /// Reset this store to its initial value when the given event fires.
+        pub fn reset(
+            self: *Self,
+            ev: anytype,
+        ) *Self {
+            const EvPayload = @TypeOf(ev.*).Payload;
+
+            const ResetCtx = struct {
+                store: *Self,
+            };
+
+            const ctx = self.eng.allocator.create(ResetCtx) catch @panic("OOM");
+            ctx.* = .{ .store = self };
+
+            self.ensureRegistered();
+            self.reducer_cleanups.append(self.eng.allocator, .{
+                .ptr = @ptrCast(ctx),
+                .destroyFn = &struct {
+                    fn destroy(alloc: std.mem.Allocator, ptr: *anyopaque) void {
+                        const typed: *ResetCtx = @ptrCast(@alignCast(ptr));
+                        alloc.destroy(typed);
+                    }
+                }.destroy,
+            }) catch @panic("OOM");
+
+            ev.reducers.append(self.eng.allocator, .{
+                .ctx = @ptrCast(ctx),
+                .trigger = &struct {
+                    fn trigger(raw_ctx: *anyopaque, _: *const anyopaque) void {
+                        const c: *ResetCtx = @ptrCast(@alignCast(raw_ctx));
+                        _ = EvPayload; // keep comptime param alive
+                        c.store.prev = c.store.value;
+                        c.store.value = c.store.initial;
+                        c.store.markDirty();
+                    }
+                }.trigger,
+            }) catch @panic("OOM");
+
+            return self;
+        }
+
+        /// Derive a new store by applying mapFn to each update.
+        pub fn map(self: *Self, comptime R: type, mapFn: *const fn (T) R) *Store(R) {
+            return MapHelper(T, R).create(self, mapFn);
+        }
+
+        pub fn ensureRegistered(self: *Self) void {
             if (self.store_index != null) return;
             self.store_index = self.eng.registerStore(.{
                 .ctx = @ptrCast(self),
@@ -151,7 +198,7 @@ pub fn Store(comptime T: type) type {
             });
         }
 
-        fn markDirty(self: *Self) void {
+        pub fn markDirty(self: *Self) void {
             if (self.last_dirty_tick == self.eng.tick_id) return; // dedup
             self.last_dirty_tick = self.eng.tick_id;
             self.dirty = true;
@@ -183,6 +230,54 @@ pub fn Store(comptime T: type) type {
                 ev.deinit();
                 self.eng.allocator.destroy(ev);
             }
+        }
+    };
+}
+
+fn MapHelper(comptime T: type, comptime R: type) type {
+    return struct {
+        fn create(source: *Store(T), mapFn: *const fn (T) R) *Store(R) {
+            const Derived = Store(R);
+            const eng = source.eng;
+            const derived = eng.allocator.create(Derived) catch @panic("OOM");
+            const init_val = mapFn(source.value);
+            derived.* = .{ .eng = eng, .value = init_val, .prev = init_val, .initial = init_val };
+            eng.trackGraphAlloc(@ptrCast(derived), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const s: *Derived = @ptrCast(@alignCast(p));
+                    s.deinit();
+                    a.destroy(s);
+                }
+            }.dtor);
+
+            const MapCtx = struct {
+                target: *Derived,
+                mapFn: *const fn (T) R,
+            };
+            const ctx = eng.allocator.create(MapCtx) catch @panic("OOM");
+            ctx.* = .{ .target = derived, .mapFn = mapFn };
+            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const c: *MapCtx = @ptrCast(@alignCast(p));
+                    a.destroy(c);
+                }
+            }.dtor);
+
+            source.updates().reducers.append(eng.allocator, .{
+                .ctx = @ptrCast(ctx),
+                .trigger = &struct {
+                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
+                        const c: *MapCtx = @ptrCast(@alignCast(raw));
+                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+                        const new_val = c.mapFn(payload.*);
+                        c.target.prev = c.target.value;
+                        c.target.value = new_val;
+                        c.target.markDirty();
+                    }
+                }.trigger,
+            }) catch @panic("OOM");
+
+            return derived;
         }
     };
 }

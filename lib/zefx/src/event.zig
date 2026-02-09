@@ -103,9 +103,108 @@ pub fn Event(comptime T: type) type {
             }
         }
 
+        /// Create a derived event that transforms each payload with mapFn.
+        pub fn map(self: *Self, comptime R: type, mapFn: *const fn (T) R) *Event(R) {
+            return EventMapHelper(T, R).create(self, mapFn);
+        }
+
+        /// Create a derived event that only fires when filterFn returns true.
+        pub fn filter(self: *Self, filterFn: *const fn (T) bool) *Self {
+            return EventFilterHelper(T).create(self, filterFn);
+        }
+
         pub fn deinit(self: *Self) void {
             self.watchers.deinit(self.eng.allocator);
             self.reducers.deinit(self.eng.allocator);
+        }
+    };
+}
+
+fn EventMapHelper(comptime T: type, comptime R: type) type {
+    return struct {
+        fn create(source: *Event(T), mapFn: *const fn (T) R) *Event(R) {
+            const Derived = Event(R);
+            const eng = source.eng;
+            const derived = eng.allocator.create(Derived) catch @panic("OOM");
+            derived.* = .{ .eng = eng };
+            eng.trackGraphAlloc(@ptrCast(derived), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const e: *Derived = @ptrCast(@alignCast(p));
+                    e.deinit();
+                    a.destroy(e);
+                }
+            }.dtor);
+
+            const MapCtx = struct {
+                target: *Derived,
+                mapFn: *const fn (T) R,
+            };
+            const ctx = eng.allocator.create(MapCtx) catch @panic("OOM");
+            ctx.* = .{ .target = derived, .mapFn = mapFn };
+            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const c: *MapCtx = @ptrCast(@alignCast(p));
+                    a.destroy(c);
+                }
+            }.dtor);
+
+            source.reducers.append(eng.allocator, .{
+                .ctx = @ptrCast(ctx),
+                .trigger = &struct {
+                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
+                        const c: *MapCtx = @ptrCast(@alignCast(raw));
+                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+                        c.target.emit(c.mapFn(payload.*));
+                    }
+                }.trigger,
+            }) catch @panic("OOM");
+
+            return derived;
+        }
+    };
+}
+
+fn EventFilterHelper(comptime T: type) type {
+    return struct {
+        fn create(source: *Event(T), filterFn: *const fn (T) bool) *Event(T) {
+            const eng = source.eng;
+            const derived = eng.allocator.create(Event(T)) catch @panic("OOM");
+            derived.* = .{ .eng = eng };
+            eng.trackGraphAlloc(@ptrCast(derived), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const e: *Event(T) = @ptrCast(@alignCast(p));
+                    e.deinit();
+                    a.destroy(e);
+                }
+            }.dtor);
+
+            const FilterCtx = struct {
+                target: *Event(T),
+                filterFn: *const fn (T) bool,
+            };
+            const ctx = eng.allocator.create(FilterCtx) catch @panic("OOM");
+            ctx.* = .{ .target = derived, .filterFn = filterFn };
+            eng.trackGraphAlloc(@ptrCast(ctx), &struct {
+                fn dtor(a: std.mem.Allocator, p: *anyopaque) void {
+                    const c: *FilterCtx = @ptrCast(@alignCast(p));
+                    a.destroy(c);
+                }
+            }.dtor);
+
+            source.reducers.append(eng.allocator, .{
+                .ctx = @ptrCast(ctx),
+                .trigger = &struct {
+                    fn trigger(raw: *anyopaque, payload_ptr: *const anyopaque) void {
+                        const c: *FilterCtx = @ptrCast(@alignCast(raw));
+                        const payload: *const T = @ptrCast(@alignCast(payload_ptr));
+                        if (c.filterFn(payload.*)) {
+                            c.target.emit(payload.*);
+                        }
+                    }
+                }.trigger,
+            }) catch @panic("OOM");
+
+            return derived;
         }
     };
 }
