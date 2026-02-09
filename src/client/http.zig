@@ -19,6 +19,12 @@ pub const CompletionResult = struct {
     pub const ResponseKind = union(enum) {
         text: []const u8,
         tool_calls: []const message.ToolCall,
+        http_error: HttpErrorDetail,
+    };
+
+    pub const HttpErrorDetail = struct {
+        status: u16,
+        message: []const u8,
     };
 };
 
@@ -128,23 +134,32 @@ pub fn streamChatCompletion(
     const status: u16 = @intFromEnum(response.head.status);
     if (status >= 400) {
         // Try to read error body
-        var transfer_buf: [4096]u8 = undefined;
-        const body_reader = response.reader(&transfer_buf);
-        const err_body = body_reader.allocRemaining(allocator, .limited(64 * 1024)) catch null;
+        var transfer_buf_err: [4096]u8 = undefined;
+        const body_reader_err = response.reader(&transfer_buf_err);
+        const err_body = body_reader_err.allocRemaining(allocator, .limited(64 * 1024)) catch null;
         defer if (err_body) |b| allocator.free(b);
-        if (!silent) {
+
+        // Extract human-readable message
+        const detail_msg = blk: {
             if (err_body) |body| {
-                if (extractErrorMessage(allocator, body)) |msg| {
-                    defer allocator.free(msg);
-                    io.printErr("Error: HTTP {d} — {s}\n", .{ status, msg });
-                } else {
-                    io.printErr("Error: HTTP {d}\n{s}\n", .{ status, body });
-                }
+                if (extractErrorMessage(allocator, body)) |msg| break :blk msg;
+                break :blk allocator.dupe(u8, body) catch allocator.dupe(u8, "Unknown error") catch "";
+            }
+            break :blk allocator.dupe(u8, "Unknown error") catch "";
+        };
+
+        if (!silent) {
+            if (detail_msg.len > 0) {
+                io.printErr("Error: HTTP {d} — {s}\n", .{ status, detail_msg });
             } else {
                 io.printErr("Error: HTTP {d}\n", .{status});
             }
         }
-        return StreamError.HttpError;
+
+        return .{
+            .response = .{ .http_error = .{ .status = status, .message = detail_msg } },
+            .usage = null,
+        };
     }
 
     // Stream SSE response

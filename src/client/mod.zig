@@ -95,6 +95,10 @@ pub fn chat(
             allocator.free(tcs);
             return error.ApiError;
         },
+        .http_error => |detail| {
+            allocator.free(detail.message);
+            return error.ApiError;
+        },
     }
 }
 

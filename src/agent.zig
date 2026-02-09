@@ -109,15 +109,44 @@ fn runInner(
         });
         defer allocator.free(body);
 
-        // Silent LLM call
-        const result = try http_client.streamChatCompletion(
-            allocator,
-            resolved.completions_url,
-            resolved.auth.api_key,
-            body,
-            &noopCallback,
-            true, // silent mode
-        );
+        // Silent LLM call with retry for transient errors
+        const result = blk: {
+            var attempt: usize = 0;
+            while (true) : (attempt += 1) {
+                const r = try http_client.streamChatCompletion(
+                    allocator,
+                    resolved.completions_url,
+                    resolved.auth.api_key,
+                    body,
+                    &noopCallback,
+                    true, // silent mode
+                );
+                switch (r.response) {
+                    .http_error => |detail| {
+                        const max_retries: usize = if (detail.status == 429) 3 else if (detail.status >= 500) 1 else 0;
+                        if (attempt < max_retries) {
+                            // Backoff: 429 → 1s, 2s, 4s; 5xx → 500ms
+                            const delay_ms: u64 = if (detail.status == 429)
+                                @as(u64, 1000) << @intCast(attempt)
+                            else
+                                500;
+                            allocator.free(detail.message);
+                            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                            if (io.isCancelRequested()) {
+                                return .{
+                                    .text = try allocator.dupe(u8, "[Cancelled]"),
+                                    .total_prompt_tokens = total_prompt,
+                                    .total_completion_tokens = total_completion,
+                                };
+                            }
+                            continue;
+                        }
+                        break :blk r;
+                    },
+                    else => break :blk r,
+                }
+            }
+        };
 
         // Accumulate token usage
         if (result.usage) |usage| {
@@ -126,6 +155,19 @@ fn runInner(
         }
 
         switch (result.response) {
+            .http_error => |detail| {
+                const err_text = std.fmt.allocPrint(
+                    allocator,
+                    "Sub-agent error: HTTP {d} — {s}",
+                    .{ detail.status, detail.message },
+                ) catch try allocator.dupe(u8, "Sub-agent error: HTTP error");
+                allocator.free(detail.message);
+                return .{
+                    .text = err_text,
+                    .total_prompt_tokens = total_prompt,
+                    .total_completion_tokens = total_completion,
+                };
+            },
             .text => |text| {
                 // Done — return the final text (caller owns it)
                 // Don't add to history since we're returning

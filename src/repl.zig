@@ -1373,7 +1373,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
         // Agentic loop: keep calling LLM until we get a text response
         var iterations: usize = 0;
-        while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
+        agentic_loop: while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Drain steering queue — inject as user-role messages
             if (steering_queue.items.len > 0) {
                 for (steering_queue.items) |steer_msg| {
@@ -1388,20 +1388,46 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             sess_state.events.phase_changed.emit(.streaming);
             state.syncStatus(&sess_state);
             io.startSpinner("Thinking...");
-            const result = client.chatMessages(
-                allocator,
-                resolved,
-                history.items,
-                tools.all_tools,
-            ) catch {
-                io.stopSpinner();
-                if (iterations == 0) {
-                    // First call failed — remove user message
-                    if (history.pop()) |removed| {
-                        freeMessage(allocator, removed);
+            const result = result_blk: {
+                var llm_attempt: usize = 0;
+                while (true) : (llm_attempt += 1) {
+                    const r = client.chatMessages(
+                        allocator,
+                        resolved,
+                        history.items,
+                        tools.all_tools,
+                    ) catch {
+                        io.stopSpinner();
+                        if (iterations == 0) {
+                            if (history.pop()) |removed| {
+                                freeMessage(allocator, removed);
+                            }
+                        }
+                        break :agentic_loop;
+                    };
+                    switch (r.response) {
+                        .http_error => |detail| {
+                            const max_retries: usize = if (detail.status == 429) 3 else if (detail.status >= 500) 1 else 0;
+                            if (llm_attempt < max_retries and !io.isCancelRequested()) {
+                                const delay_ms: u64 = if (detail.status == 429)
+                                    @as(u64, 1000) << @intCast(llm_attempt)
+                                else
+                                    500;
+                                io.stopSpinner();
+                                io.printOut("\x1b[33m\xe2\x9c\xa6 HTTP {d} — retrying in {d}s...\x1b[0m\r\n", .{
+                                    detail.status,
+                                    delay_ms / 1000,
+                                }) catch {};
+                                allocator.free(detail.message);
+                                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                                io.startSpinner("Retrying...");
+                                continue;
+                            }
+                            break :result_blk r;
+                        },
+                        else => break :result_blk r,
                     }
                 }
-                break;
             };
 
             // Check cancel after LLM call returns
@@ -1420,6 +1446,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         }
                         allocator.free(tcs);
                     },
+                    .http_error => |detail| allocator.free(detail.message),
                 }
                 sess_state.events.phase_changed.emit(.idle);
                 break;
@@ -1491,6 +1518,19 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             }
 
             switch (result.response) {
+                .http_error => |detail| {
+                    io.stopSpinner();
+                    io.printOut("\r\n\x1b[31m\xe2\x9c\xa6 HTTP {d} — {s}\x1b[0m\r\n\r\n", .{
+                        detail.status, detail.message,
+                    }) catch {};
+                    allocator.free(detail.message);
+                    if (iterations == 0) {
+                        if (history.pop()) |removed| {
+                            freeMessage(allocator, removed);
+                        }
+                    }
+                    break;
+                },
                 .text => |text| {
                     io.writeOut("\r\n") catch {};
                     try history.append(allocator, .{
