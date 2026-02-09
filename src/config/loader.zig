@@ -79,13 +79,86 @@ pub fn loadConfig(
         cli.api_key,
     );
 
+    // Build layered system prompt (or use explicit override)
+    var final_config = config.value;
+    final_config.system_prompt = try buildSystemPrompt(arena, config.value, provider);
+
     return .{
-        .config = config.value,
+        .config = final_config,
         .active_provider = provider,
         .auth = resolved_auth,
         .resolved_model = resolved_model,
         .completions_url = completions_url,
     };
+}
+
+/// Build the system prompt from layers, or return explicit override.
+/// Layers: base → provider → global ZAICA.md → project ZAICA.md
+fn buildSystemPrompt(
+    arena: std.mem.Allocator,
+    config: types.Config,
+    provider: types.ProviderPreset,
+) ![]const u8 {
+    // Explicit override: non-empty system_prompt from config/CLI wins
+    if (config.system_prompt.len > 0) return config.system_prompt;
+
+    var parts: [4][]const u8 = undefined;
+    var count: usize = 0;
+
+    // Layer 1: Base prompt
+    parts[count] = types.BASE_SYSTEM_PROMPT;
+    count += 1;
+
+    // Layer 2: Provider-specific prompt
+    if (provider.provider_prompt) |pp| {
+        parts[count] = pp;
+        count += 1;
+    }
+
+    // Layer 3: Global user prompt (~/.config/zaica/ZAICA.md)
+    if (try readGlobalZaicaMd(arena)) |content| {
+        parts[count] = content;
+        count += 1;
+    }
+
+    // Layer 4: Project prompt (./ZAICA.md in cwd)
+    if (try readProjectZaicaMd(arena)) |content| {
+        parts[count] = content;
+        count += 1;
+    }
+
+    // Join with double newline
+    if (count == 1) return parts[0];
+    return try std.mem.join(arena, "\n\n", parts[0..count]);
+}
+
+/// Read ~/.config/zaica/ZAICA.md if it exists.
+fn readGlobalZaicaMd(allocator: std.mem.Allocator) !?[]const u8 {
+    const home = env_mod.getEnv("HOME") orelse return null;
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zaica/ZAICA.md", .{home});
+    defer allocator.free(path);
+    return readTextFileAbsolute(allocator, path);
+}
+
+/// Read ./ZAICA.md from cwd if it exists.
+fn readProjectZaicaMd(allocator: std.mem.Allocator) !?[]const u8 {
+    const cwd = std.fs.cwd();
+    const file = cwd.openFile("ZAICA.md", .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1 * 1024 * 1024) catch null;
+}
+
+/// Read a text file by absolute path, returning null if not found.
+fn readTextFileAbsolute(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1 * 1024 * 1024) catch null;
 }
 
 /// Read and parse a JSON file, returning null if not found.

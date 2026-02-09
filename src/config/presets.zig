@@ -29,6 +29,7 @@ pub const anthropic = ProviderPreset{
     .chat_completions_path = "/messages",
     .requires_key = true,
     .tool_format = .anthropic_native,
+    .provider_prompt = "Use <thinking> blocks for complex reasoning.",
 };
 
 pub const openai = ProviderPreset{
