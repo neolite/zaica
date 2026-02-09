@@ -27,6 +27,7 @@ pub const anthropic = ProviderPreset{
     .default_model = "claude-sonnet-4-5-20250929",
     .chat_completions_path = "/messages",
     .requires_key = true,
+    .tool_format = .anthropic_native,
 };
 
 pub const openai = ProviderPreset{
@@ -89,4 +90,15 @@ test "glm preset values" {
     try std.testing.expectEqualStrings("GLM_API_KEY", p.key_env_var.?);
     try std.testing.expectEqualStrings("glm-4.7-flash", p.default_model);
     try std.testing.expect(p.requires_key);
+    try std.testing.expectEqual(types.ToolFormat.openai_compatible, p.tool_format);
+}
+
+test "anthropic preset has native tool format" {
+    const p = findByName("anthropic").?;
+    try std.testing.expectEqual(types.ToolFormat.anthropic_native, p.tool_format);
+}
+
+test "openai preset has openai_compatible tool format" {
+    const p = findByName("openai").?;
+    try std.testing.expectEqual(types.ToolFormat.openai_compatible, p.tool_format);
 }

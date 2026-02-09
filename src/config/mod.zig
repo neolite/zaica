@@ -92,6 +92,8 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         .resolved = resolved,
         .dump_config = cli_args.dump_config,
         .prompt = prompt,
+        .continue_last = cli_args.continue_last,
+        .session_id = if (cli_args.session_id) |s| try arena.allocator().dupe(u8, s) else null,
         .arena = arena,
     };
 }

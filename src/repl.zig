@@ -8,6 +8,7 @@ const io = @import("io.zig");
 const tools = @import("tools.zig");
 const state = @import("state.zig");
 const agent = @import("agent.zig");
+const session = @import("session.zig");
 
 /// Key event from terminal input.
 const InputKey = union(enum) {
@@ -469,7 +470,7 @@ pub const Repl = struct {
     // ── Tab completion ─────────────────────────────────────────────────
 
     /// Available slash commands for tab completion.
-    const slash_commands = [_][]const u8{ "/exit", "/help", "/quit", "/tools", "/usage" };
+    const slash_commands = [_][]const u8{ "/exit", "/help", "/quit", "/sessions", "/tools", "/usage" };
 
     /// Attempt to complete a slash command from the current buffer prefix.
     /// If exactly one command matches, replaces buffer with it.
@@ -750,6 +751,114 @@ pub const Repl = struct {
             file.writeAll("\n") catch return;
         }
     }
+
+    // ── Interactive session picker ────────────────────────────────────
+
+    /// Show an interactive session picker. Returns selected entry index or null on cancel.
+    /// Caller must be in uncook (raw) mode.
+    fn pickSession(self: *Repl, entries: []const session.SessionEntry, current_sid: ?[]const u8) ?usize {
+        if (entries.len == 0) return null;
+
+        var selected: usize = 0;
+        const count = entries.len;
+
+        // Print header + all entries initially
+        io.writeOut("\r\n\x1b[1mSessions:\x1b[0m  \x1b[2m(\xe2\x86\x91\xe2\x86\x93 navigate, Enter select, Esc cancel)\x1b[0m\r\n\r\n") catch {};
+        for (entries, 0..) |e, i| {
+            self.renderPickerLine(e, i, selected, current_sid);
+            io.writeOut("\r\n") catch {};
+        }
+
+        // Move cursor up to first entry (we're one line past the last entry)
+        io.printOut("\x1b[{d}A", .{count}) catch {};
+
+        while (true) {
+            const key = self.readKey() catch return null;
+            const old = selected;
+            switch (key) {
+                .up => selected = if (selected == 0) count - 1 else selected - 1,
+                .down => selected = if (selected == count - 1) 0 else selected + 1,
+                .enter => {
+                    // Move cursor past the list before returning
+                    if (selected < count - 1) {
+                        io.printOut("\x1b[{d}B", .{count - 1 - selected}) catch {};
+                    }
+                    io.writeOut("\r\n") catch {};
+                    return selected;
+                },
+                .ctrl_c, .eof => {
+                    if (selected < count - 1) {
+                        io.printOut("\x1b[{d}B", .{count - 1 - selected}) catch {};
+                    }
+                    io.writeOut("\r\n") catch {};
+                    return null;
+                },
+                .unknown => {
+                    // ESC (bare) — cancel
+                    if (selected < count - 1) {
+                        io.printOut("\x1b[{d}B", .{count - 1 - selected}) catch {};
+                    }
+                    io.writeOut("\r\n") catch {};
+                    return null;
+                },
+                .char => |ch| {
+                    if (ch.len == 1 and (ch[0] == 'q' or ch[0] == 'Q')) {
+                        if (selected < count - 1) {
+                            io.printOut("\x1b[{d}B", .{count - 1 - selected}) catch {};
+                        }
+                        io.writeOut("\r\n") catch {};
+                        return null;
+                    }
+                },
+                else => {},
+            }
+            if (old != selected) {
+                // Cursor is at line `old` — redraw it as deselected
+                self.renderPickerLine(entries[old], old, selected, current_sid);
+                // Move from `old` to `selected`
+                if (selected < old) {
+                    io.printOut("\x1b[{d}A", .{old - selected}) catch {};
+                } else {
+                    io.printOut("\x1b[{d}B", .{selected - old}) catch {};
+                }
+                // Redraw new selected line
+                self.renderPickerLine(entries[selected], selected, selected, current_sid);
+            }
+        }
+    }
+
+    /// Render a single picker line (overwrites current terminal line).
+    fn renderPickerLine(self: *Repl, entry: session.SessionEntry, idx: usize, selected: usize, current_sid: ?[]const u8) void {
+        _ = self;
+        const is_selected = (idx == selected);
+        const is_current = if (current_sid) |sid| std.mem.eql(u8, entry.id, sid) else false;
+
+        // Clear line and write
+        io.writeOut("\r\x1b[2K") catch {};
+        if (is_selected) {
+            // ▸ bright magenta + bold entry
+            io.writeOut("  \x1b[95m\xe2\x96\xb8\x1b[0m \x1b[1m") catch {};
+        } else {
+            io.writeOut("    \x1b[2m") catch {};
+        }
+        io.printOut("{s} ({s})", .{ entry.id, entry.model }) catch {};
+        if (is_current) {
+            io.writeOut(" \x1b[95m*\x1b[0m") catch {};
+            if (!is_selected) io.writeOut("\x1b[2m") catch {};
+        }
+        if (entry.summary) |s| {
+            // Truncate summary to ~50 chars
+            const max_len: usize = 50;
+            if (s.len > max_len) {
+                io.writeOut(" — ") catch {};
+                io.writeOut(s[0..max_len]) catch {};
+                io.writeOut("…") catch {};
+            } else {
+                io.printOut(" — {s}", .{s}) catch {};
+            }
+        }
+        io.writeOut("\x1b[0m") catch {};
+    }
 };
 
 /// Free all allocator-owned memory in a ChatMessage.
@@ -786,10 +895,11 @@ const SEPARATOR = "";
 
 fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
-    io.writeOut("  /help   — show this help\r\n") catch {};
-    io.writeOut("  /tools  — list available tools\r\n") catch {};
-    io.writeOut("  /usage  — show session token usage\r\n") catch {};
-    io.writeOut("  /exit   — quit (also /quit, /q)\r\n") catch {};
+    io.writeOut("  /help     — show this help\r\n") catch {};
+    io.writeOut("  /tools    — list available tools\r\n") catch {};
+    io.writeOut("  /usage    — show session token usage\r\n") catch {};
+    io.writeOut("  /sessions — pick & load a session\r\n") catch {};
+    io.writeOut("  /exit     — quit (also /quit, /q)\r\n") catch {};
     io.writeOut("\r\n\x1b[1mTool permissions:\x1b[0m\r\n") catch {};
     io.writeOut("  y — allow all tools\r\n") catch {};
     io.writeOut("  s — safe only (read/list/search)\r\n") catch {};
@@ -800,7 +910,114 @@ fn printHelp() void {
 /// Maximum number of agent iterations per user message.
 const MAX_AGENT_ITERATIONS = 25;
 
+/// Window size for loop detection (Attractor coding-agent-loop-spec).
+const LOOP_DETECTION_WINDOW = 10;
+
+/// Hash a tool call signature (name + args) for loop detection.
+fn hashToolSignature(name: []const u8, args: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(name);
+    hasher.update("|");
+    hasher.update(args);
+    return hasher.final();
+}
+
+/// Detect repeating patterns in a ring buffer of tool call hashes.
+/// Checks pattern lengths 1, 2, 3 — returns true if any pattern repeats
+/// enough to fill the window.
+fn detectLoop(ring: []const u64, count: usize) bool {
+    const window = @min(count, LOOP_DETECTION_WINDOW);
+    if (window < 4) return false; // need at least 4 calls for meaningful detection
+
+    const ring_len = ring.len;
+
+    // Get the last `window` entries from ring buffer
+    var recent: [LOOP_DETECTION_WINDOW]u64 = undefined;
+    var i: usize = 0;
+    while (i < window) : (i += 1) {
+        const idx = (count - window + i) % ring_len;
+        recent[i] = ring[idx];
+    }
+
+    // Check pattern lengths 1, 2, 3
+    for ([_]usize{ 1, 2, 3 }) |pattern_len| {
+        if (window % pattern_len != 0) continue;
+        if (window / pattern_len < 2) continue; // need at least 2 repetitions
+
+        const pattern = recent[0..pattern_len];
+        var all_match = true;
+        var chunk: usize = pattern_len;
+        while (chunk < window) : (chunk += pattern_len) {
+            for (0..pattern_len) |k| {
+                if (recent[chunk + k] != pattern[k]) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (!all_match) break;
+        }
+        if (all_match) return true;
+    }
+    return false;
+}
+
 /// Atomic flag for SIGWINCH (terminal resize).
+/// Print last N user/assistant text messages as a recap when resuming a session.
+fn printRecentMessages(history: *std.ArrayList(message.ChatMessage)) void {
+    const max_recap = 4;
+    const items = history.items;
+
+    // Collect indices of text messages (skip system, tool_use, tool_result)
+    var indices: [max_recap]usize = undefined;
+    var count: usize = 0;
+
+    // Walk backwards to find last max_recap text messages
+    var i: usize = items.len;
+    while (i > 0 and count < max_recap) {
+        i -= 1;
+        switch (items[i]) {
+            .text => |tm| {
+                if (tm.role == .user or tm.role == .assistant) {
+                    indices[count] = i;
+                    count += 1;
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (count == 0) return;
+
+    // Print in chronological order (indices are reversed)
+    var j: usize = count;
+    while (j > 0) {
+        j -= 1;
+        const tm = items[indices[j]].text;
+        const prefix: []const u8 = if (tm.role == .user) "you:" else "\xe2\x97\x87";
+        const max_len: usize = 120;
+        const content = tm.content;
+        const truncated = if (content.len > max_len) content[0..max_len] else content;
+        const ellipsis: []const u8 = if (content.len > max_len) "\xe2\x80\xa6" else "";
+
+        // Replace newlines with spaces for single-line display
+        var line_buf: [128]u8 = undefined;
+        const display = blk: {
+            if (truncated.len <= line_buf.len) {
+                @memcpy(line_buf[0..truncated.len], truncated);
+                const buf = line_buf[0..truncated.len];
+                for (buf) |*c| {
+                    if (c.* == '\n' or c.* == '\r') c.* = ' ';
+                }
+                break :blk buf;
+            }
+            break :blk truncated;
+        };
+
+        io.printOut("\x1b[2m  {s} {s}{s}\x1b[0m\r\n", .{ prefix, display, ellipsis }) catch {};
+    }
+    io.writeOut("\r\n") catch {};
+}
+
 var sigwinch_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// SIGWINCH signal handler — just sets the atomic flag.
@@ -809,7 +1026,7 @@ fn sigwinchHandler(_: c_int) callconv(.c) void {
 }
 
 /// Main REPL entry point — called from main.zig.
-pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig) !void {
+pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig, continue_last: bool, cli_session_id: ?[]const u8) !void {
     // Clear screen + cursor home — stay in main screen buffer so terminal scrollback works.
     // Unlike alternate screen (\x1b[?1049h), main buffer preserves content that scrolls
     // past the top of the scroll region, giving users mouse wheel + Shift+PgUp/PgDn for free.
@@ -832,9 +1049,43 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     }) catch {};
     io.writeText("\x1b[2mType /help for commands, /exit to quit.\x1b[0m\n\n") catch {};
 
-    var session = state.init(allocator, resolved.resolved_model, resolved.config.max_context_tokens, term.rows, term.cols);
-    state.bind(&session); // Set stable pointer for watchers + initial render
-    defer session.deinit();
+    var sess_state = state.init(allocator, resolved.resolved_model, resolved.config.max_context_tokens, term.rows, term.cols);
+    state.bind(&sess_state); // Set stable pointer for watchers + initial render
+    defer sess_state.deinit();
+
+    // ── Session persistence setup ──────────────────────────────────────
+    var current_session_id: ?[]const u8 = null;
+    var resumed_session = false;
+
+    // Resolve session: --continue or --session <id>
+    if (cli_session_id) |sid| {
+        current_session_id = allocator.dupe(u8, sid) catch null;
+    } else if (continue_last) {
+        current_session_id = session.findMostRecentSession(allocator) catch null;
+    }
+
+    // Generate new session ID if not resuming
+    if (current_session_id == null) {
+        current_session_id = session.generateSessionId(allocator) catch null;
+    } else {
+        resumed_session = true;
+    }
+
+    // Write metadata for new sessions
+    if (current_session_id) |sid| {
+        if (!resumed_session) {
+            session.writeMetadata(allocator, sid, .{
+                .id = sid,
+                .model = resolved.resolved_model,
+                .provider = resolved.config.provider,
+                .created_at = std.time.timestamp(),
+            }) catch {};
+        }
+    }
+
+    defer {
+        if (current_session_id) |sid| allocator.free(sid);
+    }
 
     // Install SIGWINCH handler for terminal resize
     const sa = posix.Sigaction{
@@ -872,11 +1123,93 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         .text = .{ .role = .system, .content = resolved.config.system_prompt },
     });
 
+    // Load resumed session messages (skip system prompt — use current one)
+    if (resumed_session) {
+        if (current_session_id) |sid| {
+            var loaded = session.loadSession(allocator, sid) catch |err| blk: {
+                if (err == error.SessionNotFound) {
+                    io.writeOut("\x1b[33mSession not found, starting new session.\x1b[0m\r\n") catch {};
+                    // Fall back to new session
+                    allocator.free(sid);
+                    current_session_id = session.generateSessionId(allocator) catch null;
+                    resumed_session = false;
+                    if (current_session_id) |new_sid| {
+                        session.writeMetadata(allocator, new_sid, .{
+                            .id = new_sid,
+                            .model = resolved.resolved_model,
+                            .provider = resolved.config.provider,
+                            .created_at = std.time.timestamp(),
+                        }) catch {};
+                    }
+                }
+                break :blk null;
+            };
+            if (loaded) |*l| {
+                defer l.deinit(allocator);
+                // Skip system messages from loaded session — we use current system prompt
+                for (l.messages) |msg| {
+                    switch (msg) {
+                        .text => |tm| {
+                            if (tm.role == .system) continue;
+                            const content = allocator.dupe(u8, tm.content) catch continue;
+                            history.append(allocator, .{ .text = .{ .role = tm.role, .content = content } }) catch {
+                                allocator.free(content);
+                                continue;
+                            };
+                        },
+                        .tool_use => |tu| {
+                            var tcs = allocator.alloc(message.ToolCall, tu.tool_calls.len) catch continue;
+                            var ok: usize = 0;
+                            for (tu.tool_calls) |tc| {
+                                tcs[ok] = .{
+                                    .id = allocator.dupe(u8, tc.id) catch break,
+                                    .function = .{
+                                        .name = allocator.dupe(u8, tc.function.name) catch break,
+                                        .arguments = allocator.dupe(u8, tc.function.arguments) catch break,
+                                    },
+                                };
+                                ok += 1;
+                            }
+                            if (ok == tu.tool_calls.len) {
+                                history.append(allocator, .{ .tool_use = .{ .tool_calls = tcs } }) catch {};
+                            }
+                        },
+                        .tool_result => |tr| {
+                            const tcid = allocator.dupe(u8, tr.tool_call_id) catch continue;
+                            const content = allocator.dupe(u8, tr.content) catch {
+                                allocator.free(tcid);
+                                continue;
+                            };
+                            history.append(allocator, .{ .tool_result = .{ .tool_call_id = tcid, .content = content } }) catch {
+                                allocator.free(tcid);
+                                allocator.free(content);
+                            };
+                        },
+                    }
+                }
+                const msg_count = history.items.len - 1; // minus system prompt
+                if (msg_count > 0) {
+                    io.printOut("\x1b[2mResumed session {s} ({d} messages)\x1b[0m\r\n\r\n", .{ sid, msg_count }) catch {};
+                    printRecentMessages(&history);
+                }
+            }
+        }
+    }
+
+    // Persist system prompt for new sessions
+    if (!resumed_session) {
+        if (current_session_id) |sid| {
+            session.appendMessage(allocator, sid, .{
+                .text = .{ .role = .system, .content = resolved.config.system_prompt },
+            });
+        }
+    }
+
     while (true) {
         // Check for terminal resize
         if (sigwinch_received.swap(false, .acquire)) {
             const ts = io.getTerminalSize();
-            session.events.terminal_resized.emit(.{ .rows = ts.rows, .cols = ts.cols });
+            sess_state.events.terminal_resized.emit(.{ .rows = ts.rows, .cols = ts.cols });
         }
 
         // Show cursor (entering input mode) + save scroll region cursor
@@ -911,11 +1244,101 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             printHelp();
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/sessions")) {
+            const entries = session.listSessions(allocator, 20) catch &.{};
+            defer if (entries.len > 0) session.freeSessionEntries(allocator, entries);
+            if (entries.len == 0) {
+                io.writeOut("\r\n\x1b[2mNo sessions found.\x1b[0m\r\n\r\n") catch {};
+                continue;
+            }
+            repl.uncook();
+            const picked = repl.pickSession(entries, current_session_id);
+            repl.cook();
+            if (picked) |idx| {
+                const target = entries[idx];
+                // Don't reload if it's already the current session
+                if (current_session_id) |sid| {
+                    if (std.mem.eql(u8, target.id, sid)) {
+                        io.printOut("\x1b[2mAlready on session {s}\x1b[0m\r\n\r\n", .{sid}) catch {};
+                        continue;
+                    }
+                }
+                // Load selected session
+                var loaded = session.loadSession(allocator, target.id) catch |err| blk: {
+                    io.printOut("\x1b[31mFailed to load session: {}\x1b[0m\r\n\r\n", .{err}) catch {};
+                    break :blk null;
+                };
+                if (loaded) |*l| {
+                    defer l.deinit(allocator);
+                    // Free existing history (skip [0] system prompt — borrowed from config)
+                    for (history.items[1..]) |msg| freeMessage(allocator, msg);
+                    history.shrinkRetainingCapacity(1);
+                    // Dupe loaded messages into history (skip system messages)
+                    for (l.messages) |msg| {
+                        switch (msg) {
+                            .text => |tm| {
+                                if (tm.role == .system) continue;
+                                const content = allocator.dupe(u8, tm.content) catch continue;
+                                history.append(allocator, .{ .text = .{ .role = tm.role, .content = content } }) catch {
+                                    allocator.free(content);
+                                    continue;
+                                };
+                            },
+                            .tool_use => |tu| {
+                                var tcs = allocator.alloc(message.ToolCall, tu.tool_calls.len) catch continue;
+                                var ok: usize = 0;
+                                for (tu.tool_calls) |tc| {
+                                    tcs[ok] = .{
+                                        .id = allocator.dupe(u8, tc.id) catch break,
+                                        .function = .{
+                                            .name = allocator.dupe(u8, tc.function.name) catch break,
+                                            .arguments = allocator.dupe(u8, tc.function.arguments) catch break,
+                                        },
+                                    };
+                                    ok += 1;
+                                }
+                                if (ok == tu.tool_calls.len) {
+                                    history.append(allocator, .{ .tool_use = .{ .tool_calls = tcs } }) catch {};
+                                }
+                            },
+                            .tool_result => |tr| {
+                                const tcid = allocator.dupe(u8, tr.tool_call_id) catch continue;
+                                const content = allocator.dupe(u8, tr.content) catch {
+                                    allocator.free(tcid);
+                                    continue;
+                                };
+                                history.append(allocator, .{ .tool_result = .{ .tool_call_id = tcid, .content = content } }) catch {
+                                    allocator.free(tcid);
+                                    allocator.free(content);
+                                };
+                            },
+                        }
+                    }
+                    // Update current session ID
+                    if (current_session_id) |old| allocator.free(old);
+                    current_session_id = allocator.dupe(u8, target.id) catch null;
+                    const msg_count = history.items.len - 1;
+                    io.printOut("\x1b[95m\xe2\x9c\xa6\x1b[0m Switched to session \x1b[1m{s}\x1b[0m ({d} messages)\r\n\r\n", .{ target.id, msg_count }) catch {};
+                    printRecentMessages(&history);
+                }
+            }
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/usage")) {
             io.writeOut("\r\n\x1b[1mSession token usage:\x1b[0m\r\n") catch {};
-            io.printOut("  Prompt tokens:     {d}\r\n", .{session.stores.prompt_tokens.get()}) catch {};
-            io.printOut("  Completion tokens: {d}\r\n", .{session.stores.completion_tokens.get()}) catch {};
-            io.printOut("  Total tokens:      {d}\r\n", .{session.stores.total_tokens.get()}) catch {};
+            io.printOut("  Prompt tokens:     {d}\r\n", .{sess_state.stores.prompt_tokens.get()}) catch {};
+            io.printOut("  Completion tokens: {d}\r\n", .{sess_state.stores.completion_tokens.get()}) catch {};
+            io.printOut("  Total tokens:      {d}\r\n", .{sess_state.stores.total_tokens.get()}) catch {};
+            const reasoning = sess_state.stores.reasoning_tokens.get();
+            if (reasoning > 0) {
+                io.printOut("  Reasoning tokens:  {d}\r\n", .{reasoning}) catch {};
+            }
+            const cache_r = sess_state.stores.cache_read_tokens.get();
+            const cache_w = sess_state.stores.cache_write_tokens.get();
+            if (cache_r > 0 or cache_w > 0) {
+                io.printOut("  Cache read:        {d}\r\n", .{cache_r}) catch {};
+                io.printOut("  Cache write:       {d}\r\n", .{cache_w}) catch {};
+            }
             io.printOut("  Context limit:     {d}\r\n\r\n", .{resolved.config.max_context_tokens}) catch {};
             continue;
         }
@@ -923,6 +1346,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         const user_content = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(user_content);
         try history.append(allocator, .{ .text = .{ .role = .user, .content = user_content } });
+        if (current_session_id) |sid| {
+            session.appendMessage(allocator, sid, .{ .text = .{ .role = .user, .content = user_content } });
+        }
 
         // Visual separator between input and output
         io.writeOut("\r\n") catch {};
@@ -931,14 +1357,36 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         io.clearCancelFlag();
 
         // Signal new user message — resets $iterations store
-        session.events.user_message_sent.emit({});
+        sess_state.events.user_message_sent.emit({});
+
+        // Steering queue — messages injected mid-loop (loop detection, future API)
+        var steering_queue: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (steering_queue.items) |s| allocator.free(s);
+            steering_queue.deinit(allocator);
+        }
+
+        // Loop detection ring buffer
+        var loop_ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
+        @memset(&loop_ring, 0);
+        var loop_ring_count: usize = 0;
 
         // Agentic loop: keep calling LLM until we get a text response
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
+            // Drain steering queue — inject as user-role messages
+            if (steering_queue.items.len > 0) {
+                for (steering_queue.items) |steer_msg| {
+                    try history.append(allocator, .{
+                        .text = .{ .role = .user, .content = steer_msg },
+                    });
+                }
+                // Clear without freeing — ownership transferred to history
+                steering_queue.clearRetainingCapacity();
+            }
             // Terminal is in cooked mode here — streaming works normally
-            session.events.phase_changed.emit(.streaming);
-            state.syncStatus(&session);
+            sess_state.events.phase_changed.emit(.streaming);
+            state.syncStatus(&sess_state);
             io.startSpinner("Thinking...");
             const result = client.chatMessages(
                 allocator,
@@ -959,7 +1407,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             // Check cancel after LLM call returns
             if (io.isCancelRequested()) {
                 io.stopSpinner();
-                session.events.cancel_requested.emit(true);
+                sess_state.events.cancel_requested.emit(true);
                 io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
                 // Free partial result
                 switch (result.response) {
@@ -973,15 +1421,18 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         allocator.free(tcs);
                     },
                 }
-                session.events.phase_changed.emit(.idle);
+                sess_state.events.phase_changed.emit(.idle);
                 break;
             }
 
             // Track token usage — tokens_received triggers compaction check via sample+filter
             if (result.usage) |usage| {
-                session.events.tokens_received.emit(.{
+                sess_state.events.tokens_received.emit(.{
                     .prompt_tokens = usage.prompt_tokens,
                     .completion_tokens = usage.completion_tokens,
+                    .reasoning_tokens = usage.reasoning_tokens,
+                    .cache_read_tokens = usage.cache_read_tokens,
+                    .cache_write_tokens = usage.cache_write_tokens,
                 });
 
                 // Context window warning at 80%
@@ -999,26 +1450,41 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             }
 
             // Signal iteration completed (updates $iterations store)
-            session.events.iteration_completed.emit({});
+            sess_state.events.iteration_completed.emit({});
 
-            // Context compaction: check token usage against context limit
+            // Context compaction: drop older half of history when approaching limit.
+            // Keeps [system_prompt, ...recent_messages] with a safe cut point
+            // at a user message boundary to avoid orphaned tool_result/tool_use.
             {
                 const max_ctx = resolved.config.max_context_tokens;
-                const total = session.stores.total_tokens.get();
-                const msgs = session.stores.message_count.get();
-                if (max_ctx > 0 and total > 0) {
+                const total = sess_state.stores.total_tokens.get();
+                if (max_ctx > 0 and total > 0 and history.items.len > 6) {
                     const pct = (total * 100) / @as(u64, max_ctx);
-                    if (pct >= 90 and msgs > 5 and history.items.len > 5) {
-                        const keep_tail: usize = 4;
-                        const remove_end = history.items.len - keep_tail;
-                        if (remove_end > 1) {
-                            const removed_count = remove_end - 1;
-                            for (history.items[1..remove_end]) |msg| {
+                    if (pct >= 90) {
+                        // Target: keep roughly the last half of messages
+                        const half = history.items.len / 2;
+                        const target_start = if (half < 2) @as(usize, 2) else half;
+
+                        // Scan forward from target to find a user message (safe boundary)
+                        var safe_start: usize = target_start;
+                        while (safe_start < history.items.len) {
+                            switch (history.items[safe_start]) {
+                                .text => |tm| if (tm.role == .user) break,
+                                else => {},
+                            }
+                            safe_start += 1;
+                        }
+
+                        // If no user message found, skip compaction
+                        if (safe_start < history.items.len and safe_start > 1) {
+                            const removed_count = safe_start - 1;
+                            for (history.items[1..safe_start]) |msg| {
                                 freeMessage(allocator, msg);
                             }
-                            std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[remove_end..]);
-                            history.shrinkRetainingCapacity(1 + keep_tail);
-                            io.printOut("\x1b[33m[context compacted: dropped {d} old messages]\x1b[0m\r\n", .{removed_count}) catch {};
+                            const kept_tail = history.items.len - safe_start;
+                            std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[safe_start..]);
+                            history.shrinkRetainingCapacity(1 + kept_tail);
+                            io.printOut("\x1b[33m[context compacted: dropped {d} old messages, kept {d}]\x1b[0m\r\n", .{ removed_count, kept_tail }) catch {};
                         }
                     }
                 }
@@ -1030,12 +1496,15 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     try history.append(allocator, .{
                         .text = .{ .role = .assistant, .content = text },
                     });
+                    if (current_session_id) |sid| {
+                        session.appendMessage(allocator, sid, .{ .text = .{ .role = .assistant, .content = text } });
+                    }
                     break;
                 },
                 .tool_calls => |tcs| {
                     // Ask permission on first tool use in session
-                    if (session.stores.permission.get() == .none) {
-                        session.events.phase_changed.emit(.awaiting_permission);
+                    if (sess_state.stores.permission.get() == .none) {
+                        sess_state.events.phase_changed.emit(.awaiting_permission);
                         io.writeOut("\r\n") catch {};
                         for (tcs) |tc| {
                             const risk = tools.toolRisk(tc.function.name);
@@ -1057,11 +1526,11 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
 
                         const perm = repl.readPermission() catch .none;
-                        session.events.permission_granted.emit(perm);
+                        sess_state.events.permission_granted.emit(perm);
 
                         // Check if ESC triggered cancel during permission prompt
                         if (io.isCancelRequested()) {
-                            session.events.cancel_requested.emit(true);
+                            sess_state.events.cancel_requested.emit(true);
                             io.writeOut("\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
                             // Free tool calls
                             for (tcs) |tc| {
@@ -1070,11 +1539,11 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 allocator.free(tc.function.arguments);
                             }
                             allocator.free(tcs);
-                            session.events.phase_changed.emit(.idle);
+                            sess_state.events.phase_changed.emit(.idle);
                             break;
                         }
 
-                        if (session.stores.permission.get() == .none) {
+                        if (sess_state.stores.permission.get() == .none) {
                             // Deny all tools
                             try history.append(allocator, .{
                                 .tool_use = .{ .tool_calls = tcs },
@@ -1097,6 +1566,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     try history.append(allocator, .{
                         .tool_use = .{ .tool_calls = tcs },
                     });
+                    if (current_session_id) |sid| {
+                        session.appendMessage(allocator, sid, .{ .tool_use = .{ .tool_calls = tcs } });
+                    }
 
                     // Execute tools, checking per-tool permissions.
                     // Multiple allowed tools run in parallel via std.Thread.
@@ -1111,7 +1583,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // First pass: check permissions, print status, fill denied results
                     for (tcs, 0..) |tc, i| {
-                        if (!tools.isAllowed(tc.function.name, session.stores.permission.get())) {
+                        if (!tools.isAllowed(tc.function.name, sess_state.stores.permission.get())) {
                             io.printOut("\x1b[31m  \xe2\x8a\x98 {s} (not allowed)\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
                             tool_results[i] = .{
                                 .tool_call_id = try allocator.dupe(u8, tc.id),
@@ -1139,7 +1611,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // Execute allowed tools in background threads with spinner
                     if (thread_count > 0) {
-                        session.events.phase_changed.emit(.executing_tools);
+                        sess_state.events.phase_changed.emit(.executing_tools);
 
                         // Build label from display names: "Read, Bash"
                         var label_buf: [256]u8 = undefined;
@@ -1158,7 +1630,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 label_pos += copy_len;
                             }
                         }
-                        state.syncStatus(&session);
+                        state.syncStatus(&sess_state);
                         io.startSpinner(label_buf[0..label_pos]);
 
                         const threads = try allocator.alloc(?std.Thread, thread_count);
@@ -1176,7 +1648,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                     .allocator = allocator,
                                     .tc = tcs[idx],
                                     .resolved = resolved,
-                                    .permission = session.stores.permission.get(),
+                                    .permission = sess_state.stores.permission.get(),
                                 },
                                 &tool_results[idx],
                                 &done_flags[j],
@@ -1189,7 +1661,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                         .allocator = allocator,
                                         .tc = tcs[idx],
                                         .resolved = resolved,
-                                        .permission = session.stores.permission.get(),
+                                        .permission = sess_state.stores.permission.get(),
                                     },
                                     &tool_results[idx],
                                     &done_flags[j],
@@ -1237,7 +1709,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         // Emit accumulated sub-agent token usage to zefx
                         for (tool_results) |tr| {
                             if (tr.sub_agent_usage) |usage| {
-                                session.events.tokens_received.emit(.{
+                                sess_state.events.tokens_received.emit(.{
                                     .prompt_tokens = usage.prompt_tokens,
                                     .completion_tokens = usage.completion_tokens,
                                 });
@@ -1247,7 +1719,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // Check cancel after tool execution
                     if (io.isCancelRequested()) {
-                        session.events.cancel_requested.emit(true);
+                        sess_state.events.cancel_requested.emit(true);
                         io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
                         // Still append results to history so LLM sees what happened
                         for (tool_results) |tr| {
@@ -1260,7 +1732,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                 });
                             }
                         }
-                        session.events.phase_changed.emit(.idle);
+                        sess_state.events.phase_changed.emit(.idle);
                         break;
                     }
 
@@ -1281,25 +1753,61 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         io.writeOut("\x1b[0m\r\n") catch {};
                     }
 
-                    // Append all results to history in order
-                    for (tool_results) |tr| {
+                    // Append all results to history (with LLM-facing truncation)
+                    for (tool_results, 0..) |tr, i| {
+                        const tool_name = if (i < tcs.len) tcs[i].function.name else "unknown";
+                        const truncated = tools.truncateToolOutput(allocator, tool_name, tr.content);
+                        const content = if (truncated.ptr != tr.content.ptr) blk: {
+                            // Truncation produced a new allocation — free original, use truncated
+                            allocator.free(tr.content);
+                            break :blk truncated;
+                        } else tr.content;
                         try history.append(allocator, .{
                             .tool_result = .{
                                 .tool_call_id = tr.tool_call_id,
-                                .content = tr.content,
+                                .content = content,
                             },
                         });
+                        if (current_session_id) |sid| {
+                            session.appendMessage(allocator, sid, .{
+                                .tool_result = .{ .tool_call_id = tr.tool_call_id, .content = content },
+                            });
+                        }
+
+                        // Record tool call hash for loop detection
+                        const args = if (i < tcs.len) tcs[i].function.arguments else "";
+                        loop_ring[loop_ring_count % LOOP_DETECTION_WINDOW] = hashToolSignature(tool_name, args);
+                        loop_ring_count += 1;
+                    }
+
+                    // Loop detection — check for repeating patterns
+                    if (detectLoop(&loop_ring, loop_ring_count)) {
+                        const warning = allocator.dupe(u8,
+                            "[SYSTEM WARNING: You appear to be stuck in a loop, " ++
+                            "repeating the same tool calls. Try a different approach, " ++
+                            "read the error messages carefully, or ask the user for guidance.]",
+                        ) catch null;
+                        if (warning) |w| {
+                            steering_queue.append(allocator, w) catch allocator.free(w);
+                        }
+                        io.writeOut("\x1b[33m[loop detected — injecting steering]\x1b[0m\r\n") catch {};
                     }
                 },
             }
         }
 
         // Reset phase to idle when agentic loop exits
-        session.events.phase_changed.emit(.idle);
+        sess_state.events.phase_changed.emit(.idle);
 
         if (iterations >= MAX_AGENT_ITERATIONS) {
             io.writeOut("\x1b[33m(agent loop limit reached)\x1b[0m\r\n") catch {};
         }
+    }
+
+    // Show session ID for easy resume
+    if (current_session_id) |sid| {
+        io.printOut("\r\n\x1b[2mSession: {s}\x1b[0m\r\n", .{sid}) catch {};
+        io.printOut("\x1b[2mResume:  zc -c  or  zc --session {s}\x1b[0m\r\n", .{sid}) catch {};
     }
 }
 
@@ -1484,6 +1992,46 @@ test "extractTask: invalid JSON" {
 test "extractTask: empty task" {
     const allocator = std.testing.allocator;
     try std.testing.expect(extractTask(allocator, "{\"task\":\"\"}") == null);
+}
+
+test "detectLoop: no loop with few calls" {
+    var ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
+    @memset(&ring, 0);
+    try std.testing.expect(!detectLoop(&ring, 0));
+    try std.testing.expect(!detectLoop(&ring, 3));
+}
+
+test "detectLoop: detects pattern length 1" {
+    var ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
+    // Same hash repeated 10 times
+    @memset(&ring, 42);
+    try std.testing.expect(detectLoop(&ring, 10));
+}
+
+test "detectLoop: detects pattern length 2" {
+    var ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
+    var i: usize = 0;
+    while (i < LOOP_DETECTION_WINDOW) : (i += 1) {
+        ring[i] = if (i % 2 == 0) 100 else 200;
+    }
+    try std.testing.expect(detectLoop(&ring, 10));
+}
+
+test "detectLoop: no loop with varied calls" {
+    var ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
+    var i: usize = 0;
+    while (i < LOOP_DETECTION_WINDOW) : (i += 1) {
+        ring[i] = i * 7 + 13; // all different
+    }
+    try std.testing.expect(!detectLoop(&ring, 10));
+}
+
+test "hashToolSignature: deterministic" {
+    const h1 = hashToolSignature("read_file", "{\"path\":\"foo.zig\"}");
+    const h2 = hashToolSignature("read_file", "{\"path\":\"foo.zig\"}");
+    const h3 = hashToolSignature("read_file", "{\"path\":\"bar.zig\"}");
+    try std.testing.expectEqual(h1, h2);
+    try std.testing.expect(h1 != h3);
 }
 
 test "isErrorOutput: detects errors" {

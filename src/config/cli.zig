@@ -70,6 +70,13 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
                 result.dump_config = true;
             } else if (std.mem.eql(u8, arg, "--init")) {
                 result.do_init = true;
+            } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--continue")) {
+                result.continue_last = true;
+            } else if (std.mem.eql(u8, arg, "--session")) {
+                result.session_id = args_iter.next() orelse {
+                    printFlagError("--session", "requires a session ID");
+                    return error.MissingValue;
+                };
             } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 result.show_help = true;
             } else {
@@ -112,6 +119,8 @@ const help_text =
     \\  -t, --max-tokens <int>     Maximum output tokens
     \\  --api-key <key>            API key (overrides all other key sources)
     \\  --config <path>            Path to config file
+    \\  -c, --continue             Resume the most recent session
+    \\  --session <id>             Resume a specific session by ID
     \\  --dump-config              Print resolved configuration and exit
     \\  --init                     Create default config files in ~/.config/zc/
     \\  -h, --help                 Show this help

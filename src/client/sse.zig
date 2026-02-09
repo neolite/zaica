@@ -1,10 +1,16 @@
 const std = @import("std");
 
-/// Token usage statistics from the API response.
+/// Token usage statistics from the API response (Attractor unified-llm-spec aligned).
 pub const TokenUsage = struct {
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     total_tokens: u32 = 0,
+    /// Reasoning/thinking tokens (billed as output, not visible in response text).
+    reasoning_tokens: u32 = 0,
+    /// Tokens read from prompt cache (reduced cost).
+    cache_read_tokens: u32 = 0,
+    /// Tokens written to prompt cache.
+    cache_write_tokens: u32 = 0,
 };
 
 /// A single delta fragment for a tool call being streamed.
@@ -119,6 +125,7 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseEvent {
 }
 
 /// Extract usage data from a top-level SSE JSON object.
+/// Supports OpenAI, Anthropic, and DeepSeek response formats.
 fn parseUsage(obj: std.json.ObjectMap) ?TokenUsage {
     const usage = obj.get("usage") orelse return null;
     if (usage != .object) return null;
@@ -131,6 +138,29 @@ fn parseUsage(obj: std.json.ObjectMap) ?TokenUsage {
     }
     if (usage.object.get("total_tokens")) |v| {
         if (v == .integer) result.total_tokens = @intCast(v.integer);
+    }
+    // OpenAI: completion_tokens_details.reasoning_tokens
+    if (usage.object.get("completion_tokens_details")) |details| {
+        if (details == .object) {
+            if (details.object.get("reasoning_tokens")) |v| {
+                if (v == .integer) result.reasoning_tokens = @intCast(v.integer);
+            }
+        }
+    }
+    // OpenAI: prompt_tokens_details.cached_tokens
+    if (usage.object.get("prompt_tokens_details")) |details| {
+        if (details == .object) {
+            if (details.object.get("cached_tokens")) |v| {
+                if (v == .integer) result.cache_read_tokens = @intCast(v.integer);
+            }
+        }
+    }
+    // Anthropic: cache_creation_input_tokens / cache_read_input_tokens (top-level in usage)
+    if (usage.object.get("cache_read_input_tokens")) |v| {
+        if (v == .integer) result.cache_read_tokens = @intCast(v.integer);
+    }
+    if (usage.object.get("cache_creation_input_tokens")) |v| {
+        if (v == .integer) result.cache_write_tokens = @intCast(v.integer);
     }
     // Only return if we got at least one non-zero value
     if (result.prompt_tokens > 0 or result.completion_tokens > 0 or result.total_tokens > 0) {
@@ -345,6 +375,34 @@ test "parseSseLine: DONE returns null usage" {
     const event = try parseSseLine(allocator, "data: [DONE]");
     switch (event) {
         .done => |usage| try std.testing.expect(usage == null),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseSseLine: OpenAI reasoning and cache tokens" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"completion_tokens_details\":{\"reasoning_tokens\":20},\"prompt_tokens_details\":{\"cached_tokens\":80}}}";
+    const event = try parseSseLine(allocator, line);
+    switch (event) {
+        .done => |usage| {
+            try std.testing.expect(usage != null);
+            try std.testing.expectEqual(@as(u32, 20), usage.?.reasoning_tokens);
+            try std.testing.expectEqual(@as(u32, 80), usage.?.cache_read_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseSseLine: Anthropic cache tokens" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":200,\"completion_tokens\":100,\"total_tokens\":300,\"cache_read_input_tokens\":150,\"cache_creation_input_tokens\":50}}";
+    const event = try parseSseLine(allocator, line);
+    switch (event) {
+        .done => |usage| {
+            try std.testing.expect(usage != null);
+            try std.testing.expectEqual(@as(u32, 150), usage.?.cache_read_tokens);
+            try std.testing.expectEqual(@as(u32, 50), usage.?.cache_write_tokens);
+        },
         else => return error.TestUnexpectedResult,
     }
 }

@@ -10,10 +10,13 @@ const zefx = @import("zefx");
 const io = @import("io.zig");
 const tools = @import("tools.zig");
 
-/// Token usage payload for the tokensReceived event.
+/// Token usage payload for the tokensReceived event (Attractor unified-llm-spec aligned).
 pub const TokenUsage = struct {
     prompt_tokens: u64,
     completion_tokens: u64,
+    reasoning_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
 };
 
 /// Terminal dimensions payload for the terminalResized event.
@@ -58,6 +61,9 @@ pub const SessionState = struct {
         term_cols: *zefx.Store(u16),
         phase: *zefx.Store(Phase),
         cancelled: *zefx.Store(bool),
+        reasoning_tokens: *zefx.Store(u64),
+        cache_read_tokens: *zefx.Store(u64),
+        cache_write_tokens: *zefx.Store(u64),
         iterations: *zefx.Store(u32),
         message_count: *zefx.Store(u32),
     },
@@ -117,6 +123,30 @@ pub fn init(
     _ = completion_tokens.on(tokens_received, &struct {
         fn reduce(s: u64, payload: TokenUsage) ?u64 {
             return s + payload.completion_tokens;
+        }
+    }.reduce);
+
+    // Accumulator: reasoning_tokens += payload.reasoning_tokens
+    const reasoning_tokens = domain.createStore(u64, 0);
+    _ = reasoning_tokens.on(tokens_received, &struct {
+        fn reduce(s: u64, payload: TokenUsage) ?u64 {
+            return if (payload.reasoning_tokens > 0) s + payload.reasoning_tokens else null;
+        }
+    }.reduce);
+
+    // Accumulator: cache_read_tokens += payload.cache_read_tokens
+    const cache_read_tokens = domain.createStore(u64, 0);
+    _ = cache_read_tokens.on(tokens_received, &struct {
+        fn reduce(s: u64, payload: TokenUsage) ?u64 {
+            return if (payload.cache_read_tokens > 0) s + payload.cache_read_tokens else null;
+        }
+    }.reduce);
+
+    // Accumulator: cache_write_tokens += payload.cache_write_tokens
+    const cache_write_tokens = domain.createStore(u64, 0);
+    _ = cache_write_tokens.on(tokens_received, &struct {
+        fn reduce(s: u64, payload: TokenUsage) ?u64 {
+            return if (payload.cache_write_tokens > 0) s + payload.cache_write_tokens else null;
         }
     }.reduce);
 
@@ -219,6 +249,9 @@ pub fn init(
             .term_cols = term_cols,
             .phase = phase,
             .cancelled = cancelled,
+            .reasoning_tokens = reasoning_tokens,
+            .cache_read_tokens = cache_read_tokens,
+            .cache_write_tokens = cache_write_tokens,
             .iterations = iterations,
             .message_count = message_count_store,
         },
@@ -360,6 +393,20 @@ fn formatStatic(s: *const SessionState, buf: []u8) usize {
     if (pos + sep.len < buf.len) {
         @memcpy(buf[pos..][0..sep.len], sep);
         pos += sep.len;
+    }
+
+    // Cache hit rate: "cache:85%"
+    const cache_r = s.stores.cache_read_tokens.get();
+    const cache_w = s.stores.cache_write_tokens.get();
+    if (cache_r > 0 or cache_w > 0) {
+        const total_cache = cache_r + cache_w;
+        const cache_pct = if (total_cache > 0) (cache_r * 100) / total_cache else 0;
+        const cache_str = std.fmt.bufPrint(buf[pos..], "cache:{d}%", .{cache_pct}) catch "";
+        pos += cache_str.len;
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
     }
 
     // Iterations in current turn: "3↻"

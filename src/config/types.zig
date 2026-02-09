@@ -40,6 +40,20 @@ pub const Config = struct {
     log_level: LogLevel = .info,
 };
 
+/// Wire format for tool definitions and message serialization.
+/// Each provider may expect different JSON structures for tool calls.
+pub const ToolFormat = enum {
+    /// OpenAI-compatible: tool_calls[{id, function: {name, arguments}}]
+    /// Used by: OpenAI, GLM, DeepSeek, Ollama, most OpenAI-compatible APIs
+    openai_compatible,
+    /// Anthropic Messages API: tool_use content blocks with separate tool_result messages
+    /// Used by: Anthropic (Claude)
+    anthropic_native,
+    /// Gemini native: functionCall / functionResponse parts
+    /// Used by: Google Gemini
+    gemini_native,
+};
+
 /// Built-in provider preset.
 pub const ProviderPreset = struct {
     name: []const u8,
@@ -50,6 +64,8 @@ pub const ProviderPreset = struct {
     chat_completions_path: []const u8 = "/chat/completions",
     /// Whether provider requires an API key (Ollama doesn't).
     requires_key: bool = true,
+    /// Wire format for tool calls (Attractor unified-llm-spec aligned).
+    tool_format: ToolFormat = .openai_compatible,
 };
 
 /// Resolved auth information.
@@ -90,6 +106,8 @@ pub const CliArgs = struct {
     dump_config: bool = false,
     do_init: bool = false,
     show_help: bool = false,
+    continue_last: bool = false,
+    session_id: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
 };
 
@@ -98,6 +116,8 @@ pub const LoadResult = struct {
     resolved: ResolvedConfig,
     dump_config: bool,
     prompt: ?[]const u8,
+    continue_last: bool,
+    session_id: ?[]const u8,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadResult) void {

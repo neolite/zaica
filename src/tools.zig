@@ -329,6 +329,99 @@ fn getStr(parsed: ParsedArgs, key: []const u8) ?[]const u8 {
     return val.string;
 }
 
+// ── Output truncation (Attractor-spec aligned) ──────────────────────
+
+/// Per-tool output limits for LLM context (Attractor coding-agent-loop-spec defaults).
+const OutputLimits = struct {
+    max_chars: usize,
+    max_lines: usize,
+};
+
+/// Get output limits for a tool by name.
+fn outputLimits(name: []const u8) OutputLimits {
+    if (std.mem.eql(u8, name, "read_file")) return .{ .max_chars = 50_000, .max_lines = 0 };
+    if (std.mem.eql(u8, name, "execute_bash")) return .{ .max_chars = 30_000, .max_lines = 256 };
+    if (std.mem.eql(u8, name, "search_files")) return .{ .max_chars = 20_000, .max_lines = 200 };
+    if (std.mem.eql(u8, name, "list_files")) return .{ .max_chars = 20_000, .max_lines = 500 };
+    if (std.mem.eql(u8, name, "write_file")) return .{ .max_chars = 1_000, .max_lines = 0 };
+    if (std.mem.eql(u8, name, "dispatch_agent")) return .{ .max_chars = 50_000, .max_lines = 0 };
+    return .{ .max_chars = 30_000, .max_lines = 0 };
+}
+
+/// Truncate tool output using head/tail strategy, then line-limit.
+/// Returns original slice if within limits, or an allocator-owned truncated copy.
+/// The caller must free the result ONLY if it differs from the input.
+pub fn truncateToolOutput(allocator: std.mem.Allocator, tool_name: []const u8, output: []const u8) []const u8 {
+    if (output.len == 0) return output;
+    const limits = outputLimits(tool_name);
+
+    // Step 1: Character truncation (head/tail)
+    var working = output;
+    var char_truncated = false;
+    if (working.len > limits.max_chars) {
+        const half = limits.max_chars / 2;
+        const head = working[0..half];
+        const tail = working[working.len - half ..];
+        const removed = working.len - limits.max_chars;
+        const result = std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n[WARNING: output truncated — {d} characters removed from middle]\n\n{s}",
+            .{ head, removed, tail },
+        ) catch return output;
+        working = result;
+        char_truncated = true;
+    }
+
+    // Step 2: Line truncation
+    if (limits.max_lines > 0) {
+        var line_count: usize = 0;
+        for (working) |c| {
+            if (c == '\n') line_count += 1;
+        }
+        if (line_count > limits.max_lines) {
+            const half_lines = limits.max_lines / 2;
+            // Find end of first half_lines lines
+            var head_end: usize = 0;
+            var count: usize = 0;
+            for (working, 0..) |c, idx| {
+                if (c == '\n') {
+                    count += 1;
+                    if (count == half_lines) {
+                        head_end = idx + 1;
+                        break;
+                    }
+                }
+            }
+            // Find start of last half_lines lines
+            var tail_start: usize = working.len;
+            count = 0;
+            var j: usize = working.len;
+            while (j > 0) {
+                j -= 1;
+                if (working[j] == '\n') {
+                    count += 1;
+                    if (count == half_lines) {
+                        tail_start = j + 1;
+                        break;
+                    }
+                }
+            }
+            if (head_end < tail_start) {
+                const removed_lines = line_count - limits.max_lines;
+                const result = std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n[WARNING: {d} lines removed from middle]\n{s}",
+                    .{ working[0..head_end], removed_lines, working[tail_start..] },
+                ) catch return working;
+                if (char_truncated) allocator.free(working);
+                return result;
+            }
+        }
+    }
+
+    return working;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "execute: unknown tool" {
@@ -472,4 +565,30 @@ test "isAllowed: none blocks everything" {
     try std.testing.expect(!isAllowed("execute_bash", .none));
     try std.testing.expect(!isAllowed("read_file", .none));
     try std.testing.expect(!isAllowed("list_files", .none));
+}
+
+test "truncateToolOutput: small output unchanged" {
+    const allocator = std.testing.allocator;
+    const input = "hello world";
+    const result = truncateToolOutput(allocator, "read_file", input);
+    // Should return same slice (no allocation)
+    try std.testing.expectEqual(input.ptr, result.ptr);
+}
+
+test "truncateToolOutput: large output gets head/tail" {
+    const allocator = std.testing.allocator;
+    // Create output larger than write_file limit (1000 chars)
+    const big = try allocator.alloc(u8, 2000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const result = truncateToolOutput(allocator, "write_file", big);
+    defer if (result.ptr != big.ptr) allocator.free(result);
+    try std.testing.expect(result.ptr != big.ptr); // was truncated
+    try std.testing.expect(std.mem.indexOf(u8, result, "[WARNING: output truncated") != null);
+}
+
+test "truncateToolOutput: empty output" {
+    const allocator = std.testing.allocator;
+    const result = truncateToolOutput(allocator, "read_file", "");
+    try std.testing.expectEqualStrings("", result);
 }

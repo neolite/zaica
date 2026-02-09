@@ -171,7 +171,12 @@ pub fn streamChatCompletion(
     var final_usage: ?sse.TokenUsage = null;
 
     while (try line_reader.nextLine(&line_buf)) |line| {
-        // Cancel check — between SSE events (~50-100ms latency during streaming)
+        // Cancel check — poll ESC key directly (spinner may be stopped during streaming)
+        if (!silent and !io.isCancelRequested()) {
+            if (io.pollEscKeyFast()) {
+                io.setCancelFlag();
+            }
+        }
         if (io.isCancelRequested()) break;
 
         if (first_line and line.len > 0 and line[0] == '{') {

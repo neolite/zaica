@@ -135,6 +135,42 @@ pub fn setCancelFlag() void {
     cancel_requested.store(true, .release);
 }
 
+/// Fast non-blocking ESC poll — checks for any ESC byte without disambiguation.
+/// Safe to call from any thread (opens its own /dev/tty fd).
+/// Does NOT distinguish bare ESC from escape sequences — use only when
+/// false positives (arrow keys interpreted as cancel) are acceptable
+/// (e.g., during streaming with ECHO off).
+pub fn pollEscKeyFast() bool {
+    const fd = posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer posix.close(fd);
+
+    const saved = posix.tcgetattr(fd) catch return false;
+
+    var raw = saved;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.cc[@intFromEnum(posix.V.MIN)] = 0;
+    raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+    posix.tcsetattr(fd, .NOW, raw) catch return false;
+
+    var buf: [1]u8 = undefined;
+    const n = posix.read(fd, &buf) catch {
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return false;
+    };
+
+    if (n > 0 and buf[0] == 0x1b) {
+        // Drain any remaining sequence bytes before restoring
+        var drain: [16]u8 = undefined;
+        _ = posix.read(fd, &drain) catch {};
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return true;
+    }
+
+    posix.tcsetattr(fd, .NOW, saved) catch {};
+    return false;
+}
+
 /// Non-blocking ESC detection on /dev/tty.
 /// Returns true if a bare ESC was pressed (not part of an escape sequence).
 /// Must be called from the spinner thread (raw mode is set independently).

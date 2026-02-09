@@ -143,7 +143,7 @@ fn runInner(
 
                 // Execute tools sequentially (no threads-inside-threads)
                 for (tcs) |tc| {
-                    const content = if (!tools.isAllowed(tc.function.name, permission))
+                    const raw_content = if (!tools.isAllowed(tc.function.name, permission))
                         std.fmt.allocPrint(
                             allocator,
                             "Permission denied: {s} requires higher tool access.",
@@ -151,6 +151,13 @@ fn runInner(
                         ) catch try allocator.dupe(u8, "Permission denied.")
                     else
                         tools.execute(allocator, tc);
+
+                    // Apply LLM-facing truncation
+                    const truncated = tools.truncateToolOutput(allocator, tc.function.name, raw_content);
+                    const content = if (truncated.ptr != raw_content.ptr) blk: {
+                        allocator.free(raw_content);
+                        break :blk truncated;
+                    } else raw_content;
 
                     const id = try allocator.dupe(u8, tc.id);
                     try history.append(allocator, .{

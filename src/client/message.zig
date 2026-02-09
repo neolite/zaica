@@ -151,7 +151,7 @@ fn writeMessage(writer: anytype, msg: ChatMessage) !void {
 }
 
 /// Write a JSON-escaped string (handles \n, \r, \t, \\, \", control chars).
-fn writeEscaped(writer: anytype, s: []const u8) !void {
+pub fn writeEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
             '"' => try writer.writeAll("\\\""),

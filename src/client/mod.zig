@@ -17,6 +17,26 @@ pub fn chatMessages(
     messages: []const message.ChatMessage,
     tools: ?[]const message.ToolDef,
 ) !CompletionResult {
+    return chatMessagesOpts(allocator, resolved, messages, tools, false);
+}
+
+/// Like chatMessages but with silent mode (suppresses stdout output).
+pub fn chatMessagesSilent(
+    allocator: std.mem.Allocator,
+    resolved: *const config_types.ResolvedConfig,
+    messages: []const message.ChatMessage,
+    tools: ?[]const message.ToolDef,
+) !CompletionResult {
+    return chatMessagesOpts(allocator, resolved, messages, tools, true);
+}
+
+fn chatMessagesOpts(
+    allocator: std.mem.Allocator,
+    resolved: *const config_types.ResolvedConfig,
+    messages: []const message.ChatMessage,
+    tools: ?[]const message.ToolDef,
+    silent: bool,
+) !CompletionResult {
     const body = try message.buildRequestBody(allocator, .{
         .model = resolved.resolved_model,
         .messages = messages,
@@ -27,17 +47,22 @@ pub fn chatMessages(
     });
     defer allocator.free(body);
 
+    const noop_callback = struct {
+        fn callback(_: []const u8) void {}
+    }.callback;
+    const stdout_callback = struct {
+        fn callback(content: []const u8) void {
+            io.writeText(content) catch {};
+        }
+    }.callback;
+
     return try http_client.streamChatCompletion(
         allocator,
         resolved.completions_url,
         resolved.auth.api_key,
         body,
-        &struct {
-            fn callback(content: []const u8) void {
-                io.writeText(content) catch {};
-            }
-        }.callback,
-        false,
+        if (silent) &noop_callback else &stdout_callback,
+        silent,
     );
 }
 
