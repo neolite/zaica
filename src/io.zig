@@ -112,6 +112,91 @@ pub fn printText(comptime fmt: []const u8, args: anytype) !void {
     try writeText(text);
 }
 
+// ── Cancel infrastructure ─────────────────────────────────────────────
+//
+// Cross-thread cancel signal: spinner thread sets the flag when ESC
+// is detected, main thread reads it to break out of blocking operations.
+
+/// Atomic cancel flag — set by spinner thread, read by main/SSE/agent threads.
+var cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Check if cancellation was requested (safe to call from any thread).
+pub fn isCancelRequested() bool {
+    return cancel_requested.load(.acquire);
+}
+
+/// Clear the cancel flag (call at start of each user message).
+pub fn clearCancelFlag() void {
+    cancel_requested.store(false, .release);
+}
+
+/// Set the cancel flag (used by readPermission ESC handler).
+pub fn setCancelFlag() void {
+    cancel_requested.store(true, .release);
+}
+
+/// Non-blocking ESC detection on /dev/tty.
+/// Returns true if a bare ESC was pressed (not part of an escape sequence).
+/// Must be called from the spinner thread (raw mode is set independently).
+fn pollEscKey() bool {
+    const fd = posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer posix.close(fd);
+
+    // Save current termios
+    const saved = posix.tcgetattr(fd) catch return false;
+
+    // Set non-blocking: VMIN=0 VTIME=0
+    var raw = saved;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.cc[@intFromEnum(posix.V.MIN)] = 0;
+    raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+    posix.tcsetattr(fd, .NOW, raw) catch return false;
+
+    // Try to read one byte
+    var buf: [1]u8 = undefined;
+    const n = posix.read(fd, &buf) catch {
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return false;
+    };
+
+    if (n == 0 or buf[0] != 0x1b) {
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return false;
+    }
+
+    // Got ESC — peek for sequence start with 100ms timeout
+    var peek = raw;
+    peek.cc[@intFromEnum(posix.V.MIN)] = 0;
+    peek.cc[@intFromEnum(posix.V.TIME)] = 1; // 100ms
+    posix.tcsetattr(fd, .NOW, peek) catch {
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return true; // assume bare ESC
+    };
+
+    var peek_buf: [1]u8 = undefined;
+    const pn = posix.read(fd, &peek_buf) catch {
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return true;
+    };
+
+    if (pn == 0) {
+        // No follow-up → bare ESC
+        posix.tcsetattr(fd, .NOW, saved) catch {};
+        return true;
+    }
+
+    // Follow-up byte arrived → escape sequence (arrow key etc), consume rest
+    if (peek_buf[0] == '[' or peek_buf[0] == 'O') {
+        // Read remaining sequence bytes (up to 8 bytes, non-blocking)
+        var drain: [8]u8 = undefined;
+        _ = posix.read(fd, &drain) catch {};
+    }
+
+    posix.tcsetattr(fd, .NOW, saved) catch {};
+    return false;
+}
+
 // ── Status bar spinner ────────────────────────────────────────────────
 //
 // The spinner thread renders the full status bar line (with animated
@@ -157,6 +242,13 @@ pub fn startSpinner(label: []const u8) void {
     spinner_thread = std.Thread.spawn(.{}, spinnerLoop, .{}) catch null;
 }
 
+/// Update the spinner label while it's running (thread-safe).
+pub fn setSpinnerLabel(label: []const u8) void {
+    const len = @min(label.len, spinner_label.len);
+    @memcpy(spinner_label[0..len], label[0..len]);
+    spinner_label_len.store(len, .release);
+}
+
 /// Check if the spinner is currently active (thread running).
 pub fn isSpinnerActive() bool {
     return spinner_thread != null;
@@ -178,8 +270,10 @@ const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 /// Background spinner loop — renders animated spinner in the scroll region.
 /// Uses \r to overwrite the current line in-place.
+/// Also polls for ESC key to trigger cancellation.
 fn spinnerLoop() void {
     var i: usize = 0;
+    var is_cancelling = false;
     while (!spinner_stop.load(.acquire)) {
         const label_len = spinner_label_len.load(.acquire);
 
@@ -192,18 +286,24 @@ fn spinnerLoop() void {
         @memcpy(buf[pos..][0..prefix.len], prefix);
         pos += prefix.len;
 
-        // Spinner frame in magenta
-        const color_on = "\x1b[95m";
-        @memcpy(buf[pos..][0..color_on.len], color_on);
-        pos += color_on.len;
+        // Spinner frame — red ⊘ when cancelling, magenta braille otherwise
+        if (is_cancelling) {
+            const cancel_prefix = "\x1b[31m\xe2\x8a\x98\x1b[0m "; // red ⊘
+            @memcpy(buf[pos..][0..cancel_prefix.len], cancel_prefix);
+            pos += cancel_prefix.len;
+        } else {
+            const color_on = "\x1b[95m";
+            @memcpy(buf[pos..][0..color_on.len], color_on);
+            pos += color_on.len;
 
-        const frame = spinner_frames[i % spinner_frames.len];
-        @memcpy(buf[pos..][0..frame.len], frame);
-        pos += frame.len;
+            const frame = spinner_frames[i % spinner_frames.len];
+            @memcpy(buf[pos..][0..frame.len], frame);
+            pos += frame.len;
 
-        const color_off = "\x1b[0m ";
-        @memcpy(buf[pos..][0..color_off.len], color_off);
-        pos += color_off.len;
+            const color_off = "\x1b[0m ";
+            @memcpy(buf[pos..][0..color_off.len], color_off);
+            pos += color_off.len;
+        }
 
         // Label in dim
         if (label_len > 0) {
@@ -222,6 +322,18 @@ fn spinnerLoop() void {
         pos += reset.len;
 
         writeOut(buf[0..pos]) catch {};
+
+        // Poll for ESC key (non-blocking)
+        if (!is_cancelling and !cancel_requested.load(.acquire)) {
+            if (pollEscKey()) {
+                cancel_requested.store(true, .release);
+                is_cancelling = true;
+                // Update label to "Cancelling..."
+                const cancel_label = "Cancelling...";
+                @memcpy(spinner_label[0..cancel_label.len], cancel_label);
+                spinner_label_len.store(cancel_label.len, .release);
+            }
+        }
 
         std.Thread.sleep(80_000_000); // 80ms
         i +%= 1;

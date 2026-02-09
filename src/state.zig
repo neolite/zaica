@@ -22,6 +22,14 @@ pub const TermSize = struct {
     cols: u16,
 };
 
+/// Current phase of the agentic loop.
+pub const Phase = enum(u8) {
+    idle,
+    streaming,
+    executing_tools,
+    awaiting_permission,
+};
+
 /// Reactive session state — owns the zefx domain and all events/stores.
 ///
 /// Domain is heap-allocated because zefx Events/Stores capture `*Engine`
@@ -35,6 +43,8 @@ pub const SessionState = struct {
         tokens_received: *zefx.Event(TokenUsage),
         permission_granted: *zefx.Event(tools.PermissionLevel),
         terminal_resized: *zefx.Event(TermSize),
+        phase_changed: *zefx.Event(Phase),
+        cancel_requested: *zefx.Event(bool),
     },
 
     stores: struct {
@@ -44,6 +54,8 @@ pub const SessionState = struct {
         permission: *zefx.Store(tools.PermissionLevel),
         term_rows: *zefx.Store(u16),
         term_cols: *zefx.Store(u16),
+        phase: *zefx.Store(Phase),
+        cancelled: *zefx.Store(bool),
     },
 
     model_name: []const u8,
@@ -81,6 +93,8 @@ pub fn init(
     const tokens_received = domain.createEvent(TokenUsage);
     const permission_granted = domain.createEvent(tools.PermissionLevel);
     const terminal_resized = domain.createEvent(TermSize);
+    const phase_changed = domain.createEvent(Phase);
+    const cancel_requested = domain.createEvent(bool);
 
     // ── Stores ───────────────────────────────────────────────────────
 
@@ -134,12 +148,25 @@ pub fn init(
         }
     }.reduce);
 
+    // Phase: restore from phase_changed events
+    const phase = domain.restore(phase_changed, Phase.idle);
+
+    // Cancelled: set by cancel_requested, auto-reset to false when phase returns to idle
+    const cancelled = domain.restore(cancel_requested, false);
+    _ = cancelled.on(phase_changed, &struct {
+        fn reduce(cur: bool, p: Phase) ?bool {
+            return if (p == .idle) false else cur;
+        }
+    }.reduce);
+
     // ── Watchers (side effects) ──────────────────────────────────────
     // Register watchers now — they reference the file-level session_ptr,
     // which will be set by bind() after the caller has a stable address.
     _ = total_tokens.watch(&watchRenderStatus);
     _ = permission.watch(&watchRenderStatus_perm);
     _ = term_rows.watch(&watchResize);
+    _ = cancelled.watch(&watchCancelled);
+    _ = phase.watch(&watchPhase);
 
     return SessionState{
         .domain = domain,
@@ -148,6 +175,8 @@ pub fn init(
             .tokens_received = tokens_received,
             .permission_granted = permission_granted,
             .terminal_resized = terminal_resized,
+            .phase_changed = phase_changed,
+            .cancel_requested = cancel_requested,
         },
         .stores = .{
             .prompt_tokens = prompt_tokens,
@@ -156,6 +185,8 @@ pub fn init(
             .permission = permission,
             .term_rows = term_rows,
             .term_cols = term_cols,
+            .phase = phase,
+            .cancelled = cancelled,
         },
         .model_name = model_name,
         .context_limit = context_limit,
@@ -185,6 +216,19 @@ fn watchRenderStatus(_: u64) void {
 
 /// Re-render status bar when permission changes.
 fn watchRenderStatus_perm(_: tools.PermissionLevel) void {
+    renderStatus(session_ptr);
+}
+
+/// Update status bar when cancel state changes.
+fn watchCancelled(is_cancelled: bool) void {
+    if (is_cancelled) {
+        io.setSpinnerLabel("Cancelling...");
+    }
+    renderStatus(session_ptr);
+}
+
+/// Update status bar when phase changes.
+fn watchPhase(_: Phase) void {
     renderStatus(session_ptr);
 }
 
@@ -258,6 +302,15 @@ fn formatStatic(s: *const SessionState, buf: []u8) usize {
     if (pos + perm_str.len < buf.len) {
         @memcpy(buf[pos..][0..perm_str.len], perm_str);
         pos += perm_str.len;
+    }
+
+    // Cancel indicator
+    if (s.stores.cancelled.get()) {
+        const cancel_mark = " \xe2\x8a\x98"; // " ⊘"
+        if (pos + cancel_mark.len < buf.len) {
+            @memcpy(buf[pos..][0..cancel_mark.len], cancel_mark);
+            pos += cancel_mark.len;
+        }
     }
 
     if (pos + sep.len < buf.len) {

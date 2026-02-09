@@ -53,4 +53,5 @@ test {
     _ = @import("repl.zig");
     _ = @import("state.zig");
     _ = @import("tools.zig");
+    _ = @import("agent.zig");
 }

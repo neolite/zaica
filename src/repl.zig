@@ -7,6 +7,7 @@ const message = client.message;
 const io = @import("io.zig");
 const tools = @import("tools.zig");
 const state = @import("state.zig");
+const agent = @import("agent.zig");
 
 /// Key event from terminal input.
 const InputKey = union(enum) {
@@ -202,28 +203,138 @@ pub const Repl = struct {
     }
 
     /// Parse CSI sequence (ESC [ ...).
+    /// Handles three forms:
+    ///   - Simple: ESC [ A         → arrow keys
+    ///   - Tilde:  ESC [ 3 ~       → delete, home, end
+    ///   - CSI u:  ESC [ 97 ; 5 u  → Ctrl+key (kitty keyboard protocol)
+    ///
+    /// Accumulates numeric parameters separated by ';' until a final
+    /// alphabetic byte or '~' terminates the sequence.
     fn readCsiSequence(self: *Repl) InputKey {
-        const code = self.readByte() catch return .unknown;
-        const c = code orelse return .unknown;
-        return switch (c) {
+        // Accumulate up to 4 numeric parameters (covers all practical sequences)
+        var params: [4]u32 = .{ 0, 0, 0, 0 };
+        var param_count: usize = 0;
+        var has_digits = false;
+
+        while (true) {
+            const byte = self.readByte() catch return .unknown;
+            const c = byte orelse return .unknown;
+
+            if (c >= '0' and c <= '9') {
+                // Accumulate digit into current param
+                if (param_count < params.len) {
+                    params[param_count] = params[param_count] *% 10 +% (c - '0');
+                    has_digits = true;
+                }
+            } else if (c == ';') {
+                // Advance to next parameter slot
+                if (has_digits and param_count < params.len) {
+                    param_count += 1;
+                } else if (!has_digits and param_count < params.len) {
+                    param_count += 1; // empty param = 0
+                }
+                has_digits = false;
+            } else {
+                // Final byte — close last param if digits were seen
+                if (has_digits and param_count < params.len) {
+                    param_count += 1;
+                }
+                return dispatchCsiParams(params[0..param_count], c);
+            }
+        }
+    }
+
+    /// Route a parsed CSI sequence to an InputKey based on the final byte
+    /// and accumulated parameters.
+    fn dispatchCsiParams(params: []const u32, final: u8) InputKey {
+        // CSI u: kitty keyboard protocol — ESC [ codepoint ; modifiers u
+        if (final == 'u') {
+            return parseCsiU(params);
+        }
+
+        // Tilde sequences: ESC [ N ~
+        if (final == '~' and params.len >= 1) {
+            return switch (params[0]) {
+                1 => .home,
+                3 => .delete,
+                4 => .end,
+                else => .unknown,
+            };
+        }
+
+        // Simple letter sequences (no params or params ignored)
+        return switch (final) {
             'A' => .up,
             'B' => .down,
             'C' => .right,
             'D' => .left,
             'H' => .home,
             'F' => .end,
-            '3' => blk: {
-                const tilde = self.readByte() catch break :blk .unknown;
-                break :blk if ((tilde orelse 0) == '~') .delete else .unknown;
-            },
-            '1' => blk: {
-                const next2 = self.readByte() catch break :blk .unknown;
-                break :blk if ((next2 orelse 0) == '~') .home else .unknown;
-            },
-            '4' => blk: {
-                const next2 = self.readByte() catch break :blk .unknown;
-                break :blk if ((next2 orelse 0) == '~') .end else .unknown;
-            },
+            else => .unknown,
+        };
+    }
+
+    /// Parse CSI u sequence: ESC [ codepoint ; modifiers u
+    /// Extracts the Unicode codepoint and modifier flags, then maps to InputKey.
+    /// For Ctrl+key (modifier bit 3), maps Latin and Cyrillic codepoints.
+    fn parseCsiU(params: []const u32) InputKey {
+        if (params.len < 1) return .unknown;
+        const codepoint = params[0];
+        // modifier flags: bit 2 = shift, bit 3 = alt, bit 4 = ctrl, bit 5 = super
+        const modifiers: u32 = if (params.len >= 2) params[1] else 1;
+        const is_ctrl = (modifiers & 4) != 0; // bit 3 set (modifier value has 1-based encoding: 5 = 1+4)
+
+        if (is_ctrl) {
+            // Latin lowercase → Ctrl+key
+            if (codepoint >= 'a' and codepoint <= 'z') {
+                return latinToCtrlKey(@intCast(codepoint));
+            }
+            // Latin uppercase → same Ctrl+key
+            if (codepoint >= 'A' and codepoint <= 'Z') {
+                return latinToCtrlKey(@intCast(codepoint + 32)); // lowercase
+            }
+            // Cyrillic → map to QWERTY equivalent → Ctrl+key
+            return cyrillicToCtrlKey(codepoint);
+        }
+
+        return .unknown;
+    }
+
+    /// Map a Latin lowercase letter to the corresponding Ctrl+key InputKey.
+    fn latinToCtrlKey(ch: u8) InputKey {
+        return switch (ch) {
+            'a' => .ctrl_a,
+            'c' => .ctrl_c,
+            'd' => .ctrl_d,
+            'e' => .ctrl_e,
+            'k' => .ctrl_k,
+            'l' => .ctrl_l,
+            'u' => .ctrl_u,
+            'w' => .ctrl_w,
+            else => .unknown,
+        };
+    }
+
+    /// Map a Cyrillic Unicode codepoint (ЙЦУКЕН layout) to the QWERTY Ctrl+key.
+    /// Only maps letters that have corresponding Ctrl+ bindings in the REPL.
+    fn cyrillicToCtrlKey(codepoint: u32) InputKey {
+        return switch (codepoint) {
+            // ф/Ф (0x0444/0x0424) → A key → ctrl_a
+            0x0444, 0x0424 => .ctrl_a,
+            // с/С (0x0441/0x0421) → C key → ctrl_c (also used as interrupt)
+            0x0441, 0x0421 => .ctrl_c,
+            // в/В (0x0432/0x0412) → D key → ctrl_d
+            0x0432, 0x0412 => .ctrl_d,
+            // у/У (0x0443/0x0423) → E key → ctrl_e
+            0x0443, 0x0423 => .ctrl_e,
+            // л/Л (0x043B/0x041B) → K key → ctrl_k
+            0x043B, 0x041B => .ctrl_k,
+            // д/Д (0x0434/0x0414) → L key → ctrl_l
+            0x0434, 0x0414 => .ctrl_l,
+            // г/Г (0x0433/0x0413) → U key → ctrl_u
+            0x0433, 0x0413 => .ctrl_u,
+            // ц/Ц (0x0446/0x0426) → W key → ctrl_w
+            0x0446, 0x0426 => .ctrl_w,
             else => .unknown,
         };
     }
@@ -518,6 +629,9 @@ pub const Repl = struct {
 
     /// Read a permission choice from the terminal (y/s/n).
     /// y = allow all tools, s = safe only (read/search), n = deny all.
+    /// Also accepts Cyrillic equivalents for ЙЦУКЕН layout:
+    ///   н/Н (Y key) → all, ы/Ы (S key) → safe_only, т/Т (N key) → none,
+    ///   д/Д (semantic "да") → all.
     pub fn readPermission(self: *Repl) !tools.PermissionLevel {
         self.uncook();
         defer self.streamMode();
@@ -536,9 +650,50 @@ pub const Repl = struct {
                     io.writeOut("n\r\n") catch {};
                     return .none;
                 },
+                0x1b => {
+                    // ESC — treat as deny + trigger cancel
+                    io.writeOut("n\r\n") catch {};
+                    io.setCancelFlag();
+                    return .none;
+                },
+                // Cyrillic UTF-8: 2-byte sequences starting with 0xD0 or 0xD1
+                0xD0, 0xD1 => {
+                    const second = try self.readByte() orelse continue;
+                    if (matchCyrillicPermission(byte, second)) |level| {
+                        const label: []const u8 = switch (level) {
+                            .all => "y",
+                            .safe_only => "s",
+                            .none => "n",
+                        };
+                        io.writeOut(label) catch {};
+                        io.writeOut("\r\n") catch {};
+                        return level;
+                    }
+                },
                 else => {},
             }
         }
+    }
+
+    /// Match a 2-byte Cyrillic UTF-8 sequence to a permission level.
+    /// Maps ЙЦУКЕН physical keys to their QWERTY equivalents:
+    ///   н/Н (0xD0BD/0xD09D) → Y key → .all
+    ///   ы/Ы (0xD18B/0xD0AB) → S key → .safe_only
+    ///   т/Т (0xD182/0xD0A2) → N key → .none
+    ///   д/Д (0xD0B4/0xD094) → semantic "да" (yes) → .all
+    fn matchCyrillicPermission(first: u8, second: u8) ?tools.PermissionLevel {
+        const pair: u16 = (@as(u16, first) << 8) | second;
+        return switch (pair) {
+            // н (lowercase) / Н (uppercase) — Y key on ЙЦУКЕН
+            0xD0BD, 0xD09D => .all,
+            // д (lowercase) / Д (uppercase) — semantic "да" (yes)
+            0xD0B4, 0xD094 => .all,
+            // ы (lowercase) / Ы (uppercase) — S key on ЙЦУКЕН
+            0xD18B, 0xD0AB => .safe_only,
+            // т (lowercase) / Т (uppercase) — N key on ЙЦУКЕН
+            0xD182, 0xD0A2 => .none,
+            else => null,
+        };
     }
 
     // ── Persistent history ────────────────────────────────────────────
@@ -598,28 +753,8 @@ pub const Repl = struct {
 };
 
 /// Free all allocator-owned memory in a ChatMessage.
-fn freeMessage(allocator: std.mem.Allocator, msg: message.ChatMessage) void {
-    switch (msg) {
-        .text => |tm| {
-            // System message content is borrowed from config — don't free
-            if (tm.role != .system) {
-                allocator.free(tm.content);
-            }
-        },
-        .tool_use => |tu| {
-            for (tu.tool_calls) |tc| {
-                allocator.free(tc.id);
-                allocator.free(tc.function.name);
-                allocator.free(tc.function.arguments);
-            }
-            allocator.free(tu.tool_calls);
-        },
-        .tool_result => |tr| {
-            allocator.free(tr.tool_call_id);
-            allocator.free(tr.content);
-        },
-    }
-}
+/// Delegates to message.freeMessage (shared with agent.zig).
+const freeMessage = message.freeMessage;
 
 /// Check if the input is an exit/quit command.
 /// Supports English, Russian words, and QWERTY→ЙЦУКЕН layout mistype mappings.
@@ -675,9 +810,10 @@ fn sigwinchHandler(_: c_int) callconv(.c) void {
 
 /// Main REPL entry point — called from main.zig.
 pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig) !void {
-    // Switch to alternate screen buffer — clean slate, original content restored on exit.
-    // This is what vim, less, htop do. Must happen before any zone setup.
-    io.writeOut("\x1b[?1049h") catch {};
+    // Clear screen + cursor home — stay in main screen buffer so terminal scrollback works.
+    // Unlike alternate screen (\x1b[?1049h), main buffer preserves content that scrolls
+    // past the top of the scroll region, giving users mouse wheel + Shift+PgUp/PgDn for free.
+    io.writeOut("\x1b[2J\x1b[H") catch {};
 
     // Set up terminal zones FIRST: scroll region + separator + input + status bar.
     // CSI r (DECSTBM) resets cursor to home (1,1) per VT100 spec, so we must
@@ -712,10 +848,12 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     repl.streamMode(); // start in stream mode (ECHO off) to suppress stray input
     repl.loadHistory();
     defer {
-        // Restore terminal state: reset scroll region, ensure cursor visible, restore main screen
+        // Clean up terminal: reset scroll region, clear chrome, show cursor
         io.resetScrollRegion();
-        io.writeOut("\x1b[?25h") catch {}; // ensure cursor visible before leaving
-        io.writeOut("\x1b[?1049l") catch {}; // restore main screen buffer
+        const ts = io.getTerminalSize();
+        io.printOut("\x1b[{d};1H", .{ts.rows -| 3}) catch {}; // position at first chrome row
+        io.writeOut("\x1b[J") catch {}; // clear chrome (separator + input + separator + status)
+        io.writeOut("\x1b[?25h") catch {}; // ensure cursor visible
         repl.saveHistory();
         repl.deinit();
     }
@@ -792,10 +930,14 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         // Visual separator between input and output
         io.writeOut("\r\n") catch {};
 
+        // Clear cancel flag at start of each user message
+        io.clearCancelFlag();
+
         // Agentic loop: keep calling LLM until we get a text response
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
             // Terminal is in cooked mode here — streaming works normally
+            session.events.phase_changed.emit(.streaming);
             state.syncStatus(&session);
             io.startSpinner("Thinking...");
             const result = client.chatMessages(
@@ -813,6 +955,27 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 }
                 break;
             };
+
+            // Check cancel after LLM call returns
+            if (io.isCancelRequested()) {
+                io.stopSpinner();
+                session.events.cancel_requested.emit(true);
+                io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
+                // Free partial result
+                switch (result.response) {
+                    .text => |t| allocator.free(t),
+                    .tool_calls => |tcs| {
+                        for (tcs) |tc| {
+                            allocator.free(tc.id);
+                            allocator.free(tc.function.name);
+                            allocator.free(tc.function.arguments);
+                        }
+                        allocator.free(tcs);
+                    },
+                }
+                session.events.phase_changed.emit(.idle);
+                break;
+            }
 
             // Track token usage
             if (result.usage) |usage| {
@@ -859,6 +1022,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 .tool_calls => |tcs| {
                     // Ask permission on first tool use in session
                     if (permission_level == .none) {
+                        session.events.phase_changed.emit(.awaiting_permission);
                         io.writeOut("\r\n") catch {};
                         for (tcs) |tc| {
                             const risk = tools.toolRisk(tc.function.name);
@@ -881,6 +1045,22 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                         permission_level = repl.readPermission() catch .none;
                         session.events.permission_granted.emit(permission_level);
+
+                        // Check if ESC triggered cancel during permission prompt
+                        if (io.isCancelRequested()) {
+                            session.events.cancel_requested.emit(true);
+                            io.writeOut("\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
+                            // Free tool calls
+                            for (tcs) |tc| {
+                                allocator.free(tc.id);
+                                allocator.free(tc.function.name);
+                                allocator.free(tc.function.arguments);
+                            }
+                            allocator.free(tcs);
+                            session.events.phase_changed.emit(.idle);
+                            break;
+                        }
+
                         if (permission_level == .none) {
                             // Deny all tools
                             try history.append(allocator, .{
@@ -909,7 +1089,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     // Multiple allowed tools run in parallel via std.Thread.
                     const tool_results = try allocator.alloc(ToolResult, tcs.len);
                     defer allocator.free(tool_results);
-                    @memset(tool_results, .{ .tool_call_id = "", .content = "" });
+                    @memset(tool_results, .{ .tool_call_id = "", .content = "", .sub_agent_usage = null });
 
                     // Indices of allowed tools that need execution
                     const thread_indices = try allocator.alloc(usize, tcs.len);
@@ -946,6 +1126,8 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // Execute allowed tools in background threads with spinner
                     if (thread_count > 0) {
+                        session.events.phase_changed.emit(.executing_tools);
+
                         // Build label from display names: "Read, Bash"
                         var label_buf: [256]u8 = undefined;
                         var label_pos: usize = 0;
@@ -970,27 +1152,106 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         defer allocator.free(threads);
                         @memset(threads, null);
 
-                        for (thread_indices[0..thread_count], 0..) |idx, j| {
-                            threads[j] = std.Thread.spawn(.{}, executeToolThread, .{
-                                allocator, tcs[idx], &tool_results[idx],
-                            }) catch null;
-                        }
+                        // Atomic done flags for cancel-aware join
+                        const done_flags = try allocator.alloc(std.atomic.Value(bool), thread_count);
+                        defer allocator.free(done_flags);
+                        for (done_flags) |*f| f.* = std.atomic.Value(bool).init(false);
 
                         for (thread_indices[0..thread_count], 0..) |idx, j| {
-                            if (threads[j]) |t| {
-                                t.join();
-                            } else {
-                                tool_results[idx] = .{
-                                    .tool_call_id = allocator.dupe(u8, tcs[idx].id) catch "",
-                                    .content = tools.execute(allocator, tcs[idx]),
-                                };
+                            threads[j] = std.Thread.spawn(.{}, executeToolThread, .{
+                                ToolExecContext{
+                                    .allocator = allocator,
+                                    .tc = tcs[idx],
+                                    .resolved = resolved,
+                                    .permission = permission_level,
+                                },
+                                &tool_results[idx],
+                                &done_flags[j],
+                            }) catch null;
+
+                            // If spawn failed, run synchronously (done_flag already false)
+                            if (threads[j] == null) {
+                                executeToolThread(
+                                    ToolExecContext{
+                                        .allocator = allocator,
+                                        .tc = tcs[idx],
+                                        .resolved = resolved,
+                                        .permission = permission_level,
+                                    },
+                                    &tool_results[idx],
+                                    &done_flags[j],
+                                );
+                            }
+                        }
+
+                        // Cancel-aware join: poll done flags + cancel flag
+                        var all_done = false;
+                        while (!all_done) {
+                            all_done = true;
+                            for (done_flags[0..thread_count]) |*f| {
+                                if (!f.load(.acquire)) {
+                                    all_done = false;
+                                    break;
+                                }
+                            }
+                            if (!all_done) {
+                                if (io.isCancelRequested()) break;
+                                std.Thread.sleep(50_000_000); // 50ms
+                            }
+                        }
+
+                        // Join all completed threads
+                        for (0..thread_count) |j| {
+                            if (done_flags[j].load(.acquire)) {
+                                if (threads[j]) |t| t.join();
+                            }
+                        }
+
+                        // Fill cancelled (incomplete) tool results
+                        if (!all_done) {
+                            for (thread_indices[0..thread_count], 0..) |idx, j| {
+                                if (!done_flags[j].load(.acquire)) {
+                                    tool_results[idx] = .{
+                                        .tool_call_id = allocator.dupe(u8, tcs[idx].id) catch "",
+                                        .content = allocator.dupe(u8, "[Cancelled]") catch "",
+                                    };
+                                }
                             }
                         }
 
                         io.stopSpinner();
+
+                        // Emit accumulated sub-agent token usage to zefx
+                        for (tool_results) |tr| {
+                            if (tr.sub_agent_usage) |usage| {
+                                session.events.tokens_received.emit(.{
+                                    .prompt_tokens = usage.prompt_tokens,
+                                    .completion_tokens = usage.completion_tokens,
+                                });
+                            }
+                        }
                     }
 
-                    // Print tool results with ⎿ prefix
+                    // Check cancel after tool execution
+                    if (io.isCancelRequested()) {
+                        session.events.cancel_requested.emit(true);
+                        io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
+                        // Still append results to history so LLM sees what happened
+                        for (tool_results) |tr| {
+                            if (tr.tool_call_id.len > 0) {
+                                try history.append(allocator, .{
+                                    .tool_result = .{
+                                        .tool_call_id = tr.tool_call_id,
+                                        .content = tr.content,
+                                    },
+                                });
+                            }
+                        }
+                        session.events.phase_changed.emit(.idle);
+                        break;
+                    }
+
+                    // Print tool results with ◇ prefix
                     for (0..tcs.len) |i| {
                         const content = tool_results[i].content;
                         if (content.len == 0) continue;
@@ -1020,6 +1281,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             }
         }
 
+        // Reset phase to idle when agentic loop exits
+        session.events.phase_changed.emit(.idle);
+
         if (iterations >= MAX_AGENT_ITERATIONS) {
             io.writeOut("\x1b[33m(agent loop limit reached)\x1b[0m\r\n") catch {};
         }
@@ -1030,17 +1294,53 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 const ToolResult = struct {
     tool_call_id: []const u8,
     content: []const u8,
+    /// Token usage from sub-agent execution (null for regular tools).
+    sub_agent_usage: ?struct { prompt_tokens: u64, completion_tokens: u64 } = null,
+};
+
+/// Context for tool execution threads — bundles all data needed by the thread.
+const ToolExecContext = struct {
+    allocator: std.mem.Allocator,
+    tc: message.ToolCall,
+    resolved: *const config_types.ResolvedConfig,
+    permission: tools.PermissionLevel,
 };
 
 /// Thread entry point for parallel tool execution.
-/// Each thread writes to its own slot in the results array.
-fn executeToolThread(
-    allocator: std.mem.Allocator,
-    tc: message.ToolCall,
-    result: *ToolResult,
-) void {
-    result.content = tools.execute(allocator, tc);
-    result.tool_call_id = allocator.dupe(u8, tc.id) catch "";
+/// Routes dispatch_agent to the sub-agent runtime, all others to tools.execute.
+/// Sets done_flag when finished so the main thread can poll for completion.
+fn executeToolThread(ctx: ToolExecContext, result: *ToolResult, done_flag: *std.atomic.Value(bool)) void {
+    defer done_flag.store(true, .release);
+
+    if (std.mem.eql(u8, ctx.tc.function.name, "dispatch_agent")) {
+        // Extract "task" from JSON arguments
+        const task_text = extractTask(ctx.allocator, ctx.tc.function.arguments) orelse {
+            result.content = ctx.allocator.dupe(u8, "Error: missing or invalid 'task' argument") catch "";
+            result.tool_call_id = ctx.allocator.dupe(u8, ctx.tc.id) catch "";
+            return;
+        };
+        defer ctx.allocator.free(task_text);
+
+        const sub_result = agent.run(ctx.allocator, ctx.resolved, task_text, ctx.permission);
+        result.content = sub_result.text;
+        result.sub_agent_usage = .{
+            .prompt_tokens = sub_result.total_prompt_tokens,
+            .completion_tokens = sub_result.total_completion_tokens,
+        };
+    } else {
+        result.content = tools.execute(ctx.allocator, ctx.tc);
+    }
+    result.tool_call_id = ctx.allocator.dupe(u8, ctx.tc.id) catch "";
+}
+
+/// Extract the "task" string from dispatch_agent's JSON arguments.
+fn extractTask(allocator: std.mem.Allocator, args_json: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const val = parsed.value.object.get("task") orelse return null;
+    if (val != .string or val.string.len == 0) return null;
+    return allocator.dupe(u8, val.string) catch null;
 }
 
 /// Truncate tool arguments for display (max 80 chars).
@@ -1065,6 +1365,8 @@ fn extractKeyArg(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
         "path"
     else if (std.mem.eql(u8, tool_name, "search_files"))
         "pattern"
+    else if (std.mem.eql(u8, tool_name, "dispatch_agent"))
+        "task"
     else
         return null;
 
@@ -1130,6 +1432,14 @@ test "extractKeyArg: execute_bash returns command" {
     try std.testing.expectEqualStrings("echo hello", result.?);
 }
 
+test "extractKeyArg: dispatch_agent returns task" {
+    const allocator = std.testing.allocator;
+    const result = extractKeyArg(allocator, "dispatch_agent", "{\"task\":\"read and summarize main.zig\"}");
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings("read and summarize main.zig", result.?);
+}
+
 test "extractKeyArg: unknown tool returns null" {
     const allocator = std.testing.allocator;
     try std.testing.expect(extractKeyArg(allocator, "unknown", "{}") == null);
@@ -1138,6 +1448,29 @@ test "extractKeyArg: unknown tool returns null" {
 test "extractKeyArg: invalid JSON returns null" {
     const allocator = std.testing.allocator;
     try std.testing.expect(extractKeyArg(allocator, "read_file", "not json") == null);
+}
+
+test "extractTask: valid JSON" {
+    const allocator = std.testing.allocator;
+    const result = extractTask(allocator, "{\"task\":\"analyze this file\"}");
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+    try std.testing.expectEqualStrings("analyze this file", result.?);
+}
+
+test "extractTask: missing task key" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(extractTask(allocator, "{\"other\":\"value\"}") == null);
+}
+
+test "extractTask: invalid JSON" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(extractTask(allocator, "not json") == null);
+}
+
+test "extractTask: empty task" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(extractTask(allocator, "{\"task\":\"\"}") == null);
 }
 
 test "isErrorOutput: detects errors" {
@@ -1180,4 +1513,126 @@ test "slash_commands: no match for unknown prefix" {
             match_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), match_count);
+}
+
+// ── Cyrillic permission mapping tests ────────────────────────────────
+
+test "matchCyrillicPermission: н/Н maps to .all (Y key)" {
+    // н = 0xD0 0xBD (lowercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0xBD), .all);
+    // Н = 0xD0 0x9D (uppercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0x9D), .all);
+}
+
+test "matchCyrillicPermission: д/Д maps to .all (semantic да)" {
+    // д = 0xD0 0xB4 (lowercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0xB4), .all);
+    // Д = 0xD0 0x94 (uppercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0x94), .all);
+}
+
+test "matchCyrillicPermission: ы/Ы maps to .safe_only (S key)" {
+    // ы = 0xD1 0x8B (lowercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD1, 0x8B), .safe_only);
+    // Ы = 0xD0 0xAB (uppercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0xAB), .safe_only);
+}
+
+test "matchCyrillicPermission: т/Т maps to .none (N key)" {
+    // т = 0xD1 0x82 (lowercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD1, 0x82), .none);
+    // Т = 0xD0 0xA2 (uppercase)
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0xA2), .none);
+}
+
+test "matchCyrillicPermission: unrelated Cyrillic returns null" {
+    // а = 0xD0 0xB0 — not a permission key
+    try std.testing.expectEqual(Repl.matchCyrillicPermission(0xD0, 0xB0), null);
+}
+
+// ── CSI u / Cyrillic Ctrl+key mapping tests ──────────────────────────
+
+test "cyrillicToCtrlKey: ф/Ф maps to ctrl_a (A key)" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0444), .ctrl_a); // ф
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0424), .ctrl_a); // Ф
+}
+
+test "cyrillicToCtrlKey: с/С maps to ctrl_c (C key)" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0441), .ctrl_c); // с
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0421), .ctrl_c); // С
+}
+
+test "cyrillicToCtrlKey: в/В maps to ctrl_d (D key)" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0432), .ctrl_d); // в
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0412), .ctrl_d); // В
+}
+
+test "cyrillicToCtrlKey: у/У maps to ctrl_e (E key)" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0443), .ctrl_e); // у
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0423), .ctrl_e); // У
+}
+
+test "cyrillicToCtrlKey: ц/Ц maps to ctrl_w (W key)" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0446), .ctrl_w); // ц
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0426), .ctrl_w); // Ц
+}
+
+test "cyrillicToCtrlKey: unrelated codepoint returns unknown" {
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0430), .unknown); // а
+    try std.testing.expectEqual(Repl.cyrillicToCtrlKey(0x0041), .unknown); // Latin A
+}
+
+// ── CSI dispatch tests ───────────────────────────────────────────────
+
+test "dispatchCsiParams: simple arrow keys" {
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{}, 'A'), .up);
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{}, 'B'), .down);
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{}, 'C'), .right);
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{}, 'D'), .left);
+}
+
+test "dispatchCsiParams: tilde sequences" {
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{3}, '~'), .delete);
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{1}, '~'), .home);
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{4}, '~'), .end);
+}
+
+test "dispatchCsiParams: CSI u Latin Ctrl+a (97;5u)" {
+    // 97 = 'a', 5 = 1 + Ctrl(4)
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{ 97, 5 }, 'u'), .ctrl_a);
+}
+
+test "dispatchCsiParams: CSI u Cyrillic Ctrl+ф (1092;5u → ctrl_a)" {
+    // 1092 = 0x0444 = ф, 5 = Ctrl
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{ 1092, 5 }, 'u'), .ctrl_a);
+}
+
+test "dispatchCsiParams: CSI u Cyrillic Ctrl+ц (1094;5u → ctrl_w)" {
+    // 1094 = 0x0446 = ц (W key on ЙЦУКЕН), 5 = Ctrl
+    try std.testing.expectEqual(Repl.dispatchCsiParams(&.{ 1094, 5 }, 'u'), .ctrl_w);
+}
+
+test "parseCsiU: no params returns unknown" {
+    try std.testing.expectEqual(Repl.parseCsiU(&.{}), .unknown);
+}
+
+test "parseCsiU: codepoint without Ctrl modifier returns unknown" {
+    // 97 with modifier 1 (no modifiers) → not Ctrl
+    try std.testing.expectEqual(Repl.parseCsiU(&.{ 97, 1 }), .unknown);
+}
+
+test "latinToCtrlKey: maps all supported keys" {
+    try std.testing.expectEqual(Repl.latinToCtrlKey('a'), .ctrl_a);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('c'), .ctrl_c);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('d'), .ctrl_d);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('e'), .ctrl_e);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('k'), .ctrl_k);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('l'), .ctrl_l);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('u'), .ctrl_u);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('w'), .ctrl_w);
+}
+
+test "latinToCtrlKey: unsupported key returns unknown" {
+    try std.testing.expectEqual(Repl.latinToCtrlKey('z'), .unknown);
+    try std.testing.expectEqual(Repl.latinToCtrlKey('b'), .unknown);
 }

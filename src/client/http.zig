@@ -55,15 +55,18 @@ const ToolCallAccumulator = struct {
 
 /// Stream a chat completion response, calling `on_content` for each token.
 /// Returns either full text or accumulated tool calls.
+/// When `silent` is true, all terminal output (spinners, prefixes, escape codes) is suppressed.
+/// Content is still accumulated and tool calls are still parsed — only I/O side effects are skipped.
 pub fn streamChatCompletion(
     allocator: std.mem.Allocator,
     completions_url: []const u8,
     api_key: ?[]const u8,
     request_body: []const u8,
     on_content: *const fn ([]const u8) void,
+    silent: bool,
 ) !CompletionResult {
     const uri = std.Uri.parse(completions_url) catch {
-        io.printErr("Error: Invalid URL: {s}\n", .{completions_url});
+        if (!silent) io.printErr("Error: Invalid URL: {s}\n", .{completions_url});
         return StreamError.ConnectionFailed;
     };
 
@@ -88,7 +91,7 @@ pub fn streamChatCompletion(
             .{ .name = "accept", .value = "text/event-stream" },
         },
     }) catch |err| {
-        io.printErr("Error: Failed to connect to {s}: {}\n", .{ completions_url, err });
+        if (!silent) io.printErr("Error: Failed to connect to {s}: {}\n", .{ completions_url, err });
         return StreamError.ConnectionFailed;
     };
     defer req.deinit();
@@ -96,20 +99,20 @@ pub fn streamChatCompletion(
     // Send request body
     req.transfer_encoding = .{ .content_length = request_body.len };
     var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
-        io.printErr("Error: Failed to send request: {}\n", .{err});
+        if (!silent) io.printErr("Error: Failed to send request: {}\n", .{err});
         return StreamError.RequestFailed;
     };
     body_writer.writer.writeAll(request_body) catch |err| {
-        io.printErr("Error: Failed to write request body: {}\n", .{err});
+        if (!silent) io.printErr("Error: Failed to write request body: {}\n", .{err});
         return StreamError.RequestFailed;
     };
     body_writer.end() catch |err| {
-        io.printErr("Error: Failed to finish request: {}\n", .{err});
+        if (!silent) io.printErr("Error: Failed to finish request: {}\n", .{err});
         return StreamError.RequestFailed;
     };
     if (req.connection) |conn| {
         conn.flush() catch |err| {
-            io.printErr("Error: Failed to flush request: {}\n", .{err});
+            if (!silent) io.printErr("Error: Failed to flush request: {}\n", .{err});
             return StreamError.RequestFailed;
         };
     }
@@ -117,7 +120,7 @@ pub fn streamChatCompletion(
     // Receive response headers
     var redirect_buffer: [8192]u8 = undefined;
     var response = req.receiveHead(&redirect_buffer) catch |err| {
-        io.printErr("Error: Failed to receive response: {}\n", .{err});
+        if (!silent) io.printErr("Error: Failed to receive response: {}\n", .{err});
         return StreamError.RequestFailed;
     };
 
@@ -129,15 +132,17 @@ pub fn streamChatCompletion(
         const body_reader = response.reader(&transfer_buf);
         const err_body = body_reader.allocRemaining(allocator, .limited(64 * 1024)) catch null;
         defer if (err_body) |b| allocator.free(b);
-        if (err_body) |body| {
-            if (extractErrorMessage(allocator, body)) |msg| {
-                defer allocator.free(msg);
-                io.printErr("Error: HTTP {d} — {s}\n", .{ status, msg });
+        if (!silent) {
+            if (err_body) |body| {
+                if (extractErrorMessage(allocator, body)) |msg| {
+                    defer allocator.free(msg);
+                    io.printErr("Error: HTTP {d} — {s}\n", .{ status, msg });
+                } else {
+                    io.printErr("Error: HTTP {d}\n{s}\n", .{ status, body });
+                }
             } else {
-                io.printErr("Error: HTTP {d}\n{s}\n", .{ status, body });
+                io.printErr("Error: HTTP {d}\n", .{status});
             }
-        } else {
-            io.printErr("Error: HTTP {d}\n", .{status});
         }
         return StreamError.HttpError;
     }
@@ -166,13 +171,18 @@ pub fn streamChatCompletion(
     var final_usage: ?sse.TokenUsage = null;
 
     while (try line_reader.nextLine(&line_buf)) |line| {
+        // Cancel check — between SSE events (~50-100ms latency during streaming)
+        if (io.isCancelRequested()) break;
+
         if (first_line and line.len > 0 and line[0] == '{') {
             // Plain JSON response — likely an error
-            if (extractErrorMessage(allocator, line)) |msg| {
-                defer allocator.free(msg);
-                io.printErr("Error: {s}\n", .{msg});
-            } else {
-                io.printErr("Error: {s}\n", .{line});
+            if (!silent) {
+                if (extractErrorMessage(allocator, line)) |msg| {
+                    defer allocator.free(msg);
+                    io.printErr("Error: {s}\n", .{msg});
+                } else {
+                    io.printErr("Error: {s}\n", .{line});
+                }
             }
             return StreamError.ApiError;
         }
@@ -182,34 +192,40 @@ pub fn streamChatCompletion(
         switch (event) {
             .reasoning => |text| {
                 defer allocator.free(text);
-                io.stopSpinner();
-                if (!in_reasoning) {
-                    io.writeOut("\x1b[95m\xe2\x9c\xa7 Thinking...\x1b[0m\r\n\x1b[2m") catch {};
-                    in_reasoning = true;
+                if (!silent) {
+                    io.stopSpinner();
+                    if (!in_reasoning) {
+                        io.writeOut("\x1b[95m\xe2\x9c\xa7 Thinking...\x1b[0m\r\n\x1b[2m") catch {};
+                    }
+                    io.writeText(text) catch {};
                 }
-                io.writeText(text) catch {};
+                in_reasoning = true;
             },
             .content => |content| {
                 defer allocator.free(content);
-                io.stopSpinner();
-                if (in_reasoning) {
-                    io.writeOut("\x1b[0m\r\n\r\n") catch {};
-                    in_reasoning = false;
+                if (!silent) {
+                    io.stopSpinner();
+                    if (in_reasoning) {
+                        io.writeOut("\x1b[0m\r\n\r\n") catch {};
+                    }
+                    if (first_content) {
+                        io.writeOut("\r\n\x1b[95m\xe2\x97\x87\x1b[0m ") catch {}; // magenta ◇
+                    }
                 }
-                if (first_content) {
-                    io.writeOut("\r\n\x1b[95m\xe2\x97\x87\x1b[0m ") catch {}; // magenta ◇
-                    first_content = false;
-                }
+                in_reasoning = false;
+                first_content = false;
                 on_content(content);
                 try response_buf.appendSlice(allocator, content);
             },
             .tool_call_delta => |delta| {
                 defer sse.freeToolCallDelta(allocator, delta);
-                io.stopSpinner();
-                if (in_reasoning) {
-                    io.writeOut("\x1b[0m\r\n\r\n") catch {};
-                    in_reasoning = false;
+                if (!silent) {
+                    io.stopSpinner();
+                    if (in_reasoning) {
+                        io.writeOut("\x1b[0m\r\n\r\n") catch {};
+                    }
                 }
+                in_reasoning = false;
 
                 // New tool call starting (has id)
                 if (delta.id != null) {
@@ -217,11 +233,13 @@ pub fn streamChatCompletion(
                     if (delta.id) |id| try acc.id.appendSlice(allocator, id);
                     if (delta.function_name) |name| {
                         try acc.name.appendSlice(allocator, name);
-                        // Show tool call name as it arrives (CC-style bold)
-                        io.writeOut("\x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
-                        io.writeOut("\x1b[1m") catch {};
-                        io.writeOut(ccToolName(name)) catch {};
-                        io.writeOut("\x1b[0m\r\n") catch {};
+                        if (!silent) {
+                            // Show tool call name as it arrives (CC-style bold)
+                            io.writeOut("\x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
+                            io.writeOut("\x1b[1m") catch {};
+                            io.writeOut(ccToolName(name)) catch {};
+                            io.writeOut("\x1b[0m\r\n") catch {};
+                        }
                     }
                     if (delta.function_arguments) |args| try acc.arguments.appendSlice(allocator, args);
                     try tc_accumulators.append(allocator, acc);
@@ -235,18 +253,20 @@ pub fn streamChatCompletion(
             },
             .done => |usage| {
                 if (usage) |u| final_usage = u;
-                if (in_reasoning) {
+                if (!silent and in_reasoning) {
                     io.writeOut("\x1b[0m\r\n") catch {};
                 }
                 break;
             },
             .api_error => |err_msg| {
                 defer allocator.free(err_msg);
-                io.stopSpinner();
-                if (in_reasoning) {
-                    io.writeOut("\x1b[0m") catch {};
+                if (!silent) {
+                    io.stopSpinner();
+                    if (in_reasoning) {
+                        io.writeOut("\x1b[0m") catch {};
+                    }
+                    io.printErr("\nAPI Error: {s}\n", .{err_msg});
                 }
-                io.printErr("\nAPI Error: {s}\n", .{err_msg});
                 return StreamError.ApiError;
             },
             .skip => {},
@@ -287,6 +307,7 @@ fn ccToolName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "write_file")) return "Write";
     if (std.mem.eql(u8, name, "list_files")) return "List";
     if (std.mem.eql(u8, name, "search_files")) return "Search";
+    if (std.mem.eql(u8, name, "dispatch_agent")) return "Agent";
     return name;
 }
 

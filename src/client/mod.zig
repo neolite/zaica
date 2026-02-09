@@ -37,6 +37,7 @@ pub fn chatMessages(
                 io.writeText(content) catch {};
             }
         }.callback,
+        false,
     );
 }
 

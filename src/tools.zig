@@ -12,6 +12,7 @@ pub const ToolRisk = enum {
 /// Get the risk level of a tool by name.
 pub fn toolRisk(name: []const u8) ToolRisk {
     if (std.mem.eql(u8, name, "execute_bash")) return .dangerous;
+    if (std.mem.eql(u8, name, "dispatch_agent")) return .dangerous;
     if (std.mem.eql(u8, name, "write_file")) return .write;
     return .safe;
 }
@@ -39,6 +40,7 @@ pub fn displayToolName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "write_file")) return "Write";
     if (std.mem.eql(u8, name, "list_files")) return "List";
     if (std.mem.eql(u8, name, "search_files")) return "Search";
+    if (std.mem.eql(u8, name, "dispatch_agent")) return "Agent";
     return name;
 }
 
@@ -74,8 +76,9 @@ pub fn printToolList() void {
     io.writeOut("\r\n") catch {};
 }
 
-/// All available tool definitions for the agent.
-pub const all_tools: []const message.ToolDef = &.{
+/// All tool definitions stored in a fixed-size array.
+/// First 5 are standard tools, [5] is dispatch_agent (excluded from sub-agent tools).
+const tools_array = [6]message.ToolDef{
     .{ .function = .{
         .name = "execute_bash",
         .description = "Execute a bash command and return stdout+stderr. Has a 10-second timeout. Do NOT run interactive programs (editors, REPLs, servers) or 'zig build run' — they will be killed. Use for short commands: ls, cat, grep, git, zig build, etc.",
@@ -111,7 +114,23 @@ pub const all_tools: []const message.ToolDef = &.{
         \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern (grep regex)"},"path":{"type":"string","description":"Directory to search in (default: current directory)"}},"required":["pattern"]}
         ,
     } },
+    .{ .function = .{
+        .name = "dispatch_agent",
+        .description = "Dispatch an autonomous sub-agent to work on a specific task in parallel. " ++
+            "The sub-agent has access to file and bash tools and works independently. " ++
+            "Use when you need to perform multiple independent tasks simultaneously. " ++
+            "Each sub-agent runs its own tool loop and returns a text result.",
+        .parameters =
+        \\{"type":"object","properties":{"task":{"type":"string","description":"A clear, self-contained task description for the sub-agent"}},"required":["task"]}
+        ,
+    } },
 };
+
+/// All tool definitions for the main agent (includes dispatch_agent).
+pub const all_tools: []const message.ToolDef = &tools_array;
+
+/// Tool definitions for sub-agents — excludes dispatch_agent to prevent recursion.
+pub const sub_agent_tools: []const message.ToolDef = tools_array[0..5];
 
 /// Execute a tool call and return the result as a string.
 /// Errors are returned as error description strings (so the LLM can handle them).
@@ -415,11 +434,24 @@ test "bash timeout: non-zero exit code" {
 
 test "toolRisk: correct risk levels" {
     try std.testing.expectEqual(ToolRisk.dangerous, toolRisk("execute_bash"));
+    try std.testing.expectEqual(ToolRisk.dangerous, toolRisk("dispatch_agent"));
     try std.testing.expectEqual(ToolRisk.write, toolRisk("write_file"));
     try std.testing.expectEqual(ToolRisk.safe, toolRisk("read_file"));
     try std.testing.expectEqual(ToolRisk.safe, toolRisk("list_files"));
     try std.testing.expectEqual(ToolRisk.safe, toolRisk("search_files"));
     try std.testing.expectEqual(ToolRisk.safe, toolRisk("unknown_tool"));
+}
+
+test "displayToolName: dispatch_agent maps to Agent" {
+    try std.testing.expectEqualStrings("Agent", displayToolName("dispatch_agent"));
+    try std.testing.expectEqualStrings("Bash", displayToolName("execute_bash"));
+}
+
+test "sub_agent_tools: excludes dispatch_agent" {
+    for (sub_agent_tools) |tool| {
+        try std.testing.expect(!std.mem.eql(u8, tool.function.name, "dispatch_agent"));
+    }
+    try std.testing.expectEqual(@as(usize, 5), sub_agent_tools.len);
 }
 
 test "isAllowed: all permission" {

@@ -167,6 +167,30 @@ fn writeEscaped(writer: anytype, s: []const u8) !void {
     }
 }
 
+/// Free all allocator-owned memory in a ChatMessage.
+/// System message content is borrowed from config and must not be freed.
+pub fn freeMessage(allocator: std.mem.Allocator, msg: ChatMessage) void {
+    switch (msg) {
+        .text => |tm| {
+            if (tm.role != .system) {
+                allocator.free(tm.content);
+            }
+        },
+        .tool_use => |tu| {
+            for (tu.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.function.name);
+                allocator.free(tc.function.arguments);
+            }
+            allocator.free(tu.tool_calls);
+        },
+        .tool_result => |tr| {
+            allocator.free(tr.tool_call_id);
+            allocator.free(tr.content);
+        },
+    }
+}
+
 test "buildRequestBody: basic request" {
     const allocator = std.testing.allocator;
     const messages = [_]ChatMessage{
