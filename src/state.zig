@@ -45,6 +45,8 @@ pub const SessionState = struct {
         terminal_resized: *zefx.Event(TermSize),
         phase_changed: *zefx.Event(Phase),
         cancel_requested: *zefx.Event(bool),
+        iteration_completed: *zefx.Event(void),
+        user_message_sent: *zefx.Event(void),
     },
 
     stores: struct {
@@ -56,6 +58,8 @@ pub const SessionState = struct {
         term_cols: *zefx.Store(u16),
         phase: *zefx.Store(Phase),
         cancelled: *zefx.Store(bool),
+        iterations: *zefx.Store(u32),
+        message_count: *zefx.Store(u32),
     },
 
     model_name: []const u8,
@@ -95,6 +99,8 @@ pub fn init(
     const terminal_resized = domain.createEvent(TermSize);
     const phase_changed = domain.createEvent(Phase);
     const cancel_requested = domain.createEvent(bool);
+    const iteration_completed = domain.createEvent(void);
+    const user_message_sent = domain.createEvent(void);
 
     // ── Stores ───────────────────────────────────────────────────────
 
@@ -159,6 +165,28 @@ pub fn init(
         }
     }.reduce);
 
+    // Iterations: count per turn, reset on new user message
+    const iterations = domain.createStore(u32, 0);
+    _ = iterations.on(iteration_completed, &struct {
+        fn reduce(s: u32, _: void) ?u32 {
+            return s + 1;
+        }
+    }.reduce);
+    _ = iterations.reset(user_message_sent);
+
+    // Message count: total messages in conversation
+    const message_count_store = domain.createStore(u32, 0);
+    _ = message_count_store.on(user_message_sent, &struct {
+        fn reduce(s: u32, _: void) ?u32 {
+            return s + 1;
+        }
+    }.reduce);
+    _ = message_count_store.on(iteration_completed, &struct {
+        fn reduce(s: u32, _: void) ?u32 {
+            return s + 1;
+        }
+    }.reduce);
+
     // ── Watchers (side effects) ──────────────────────────────────────
     // Register watchers now — they reference the file-level session_ptr,
     // which will be set by bind() after the caller has a stable address.
@@ -167,6 +195,8 @@ pub fn init(
     _ = term_rows.watch(&watchResize);
     _ = cancelled.watch(&watchCancelled);
     _ = phase.watch(&watchPhase);
+    _ = iterations.watch(&watchRenderStatus_iter);
+    _ = message_count_store.watch(&watchRenderStatus_msgs);
 
     return SessionState{
         .domain = domain,
@@ -177,6 +207,8 @@ pub fn init(
             .terminal_resized = terminal_resized,
             .phase_changed = phase_changed,
             .cancel_requested = cancel_requested,
+            .iteration_completed = iteration_completed,
+            .user_message_sent = user_message_sent,
         },
         .stores = .{
             .prompt_tokens = prompt_tokens,
@@ -187,6 +219,8 @@ pub fn init(
             .term_cols = term_cols,
             .phase = phase,
             .cancelled = cancelled,
+            .iterations = iterations,
+            .message_count = message_count_store,
         },
         .model_name = model_name,
         .context_limit = context_limit,
@@ -216,6 +250,16 @@ fn watchRenderStatus(_: u64) void {
 
 /// Re-render status bar when permission changes.
 fn watchRenderStatus_perm(_: tools.PermissionLevel) void {
+    renderStatus(session_ptr);
+}
+
+/// Re-render status bar when iterations change.
+fn watchRenderStatus_iter(_: u32) void {
+    renderStatus(session_ptr);
+}
+
+/// Re-render status bar when message count changes.
+fn watchRenderStatus_msgs(_: u32) void {
     renderStatus(session_ptr);
 }
 
@@ -316,6 +360,28 @@ fn formatStatic(s: *const SessionState, buf: []u8) usize {
     if (pos + sep.len < buf.len) {
         @memcpy(buf[pos..][0..sep.len], sep);
         pos += sep.len;
+    }
+
+    // Iterations in current turn: "3↻"
+    const iter_count = s.stores.iterations.get();
+    if (iter_count > 0) {
+        const iter_str = std.fmt.bufPrint(buf[pos..], "{d}\xe2\x86\xbb", .{iter_count}) catch "";
+        pos += iter_str.len;
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
+    }
+
+    // Message count: "12msg"
+    const msg_count = s.stores.message_count.get();
+    if (msg_count > 0) {
+        const msg_str = std.fmt.bufPrint(buf[pos..], "{d}msg", .{msg_count}) catch "";
+        pos += msg_str.len;
+        if (pos + sep.len < buf.len) {
+            @memcpy(buf[pos..][0..sep.len], sep);
+            pos += sep.len;
+        }
     }
 
     // Elapsed time "H:MM:SS"
@@ -448,4 +514,40 @@ test "formatTokens: zero usage" {
     var buf: [64]u8 = undefined;
     const len = formatTokens(&buf, 0, 128000);
     try std.testing.expectEqualStrings("0/128k (0%)", buf[0..len]);
+}
+
+test "iterations: increments on iteration_completed, resets on user_message_sent" {
+    const allocator = std.testing.allocator;
+    var session = init(allocator, "test-model", 128000, 24, 80);
+    bind(&session);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), session.stores.iterations.get());
+
+    session.events.iteration_completed.emit({});
+    try std.testing.expectEqual(@as(u32, 1), session.stores.iterations.get());
+
+    session.events.iteration_completed.emit({});
+    try std.testing.expectEqual(@as(u32, 2), session.stores.iterations.get());
+
+    session.events.user_message_sent.emit({});
+    try std.testing.expectEqual(@as(u32, 0), session.stores.iterations.get());
+}
+
+test "message_count: increments on user_message_sent and iteration_completed" {
+    const allocator = std.testing.allocator;
+    var session = init(allocator, "test-model", 128000, 24, 80);
+    bind(&session);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), session.stores.message_count.get());
+
+    session.events.user_message_sent.emit({});
+    try std.testing.expectEqual(@as(u32, 1), session.stores.message_count.get());
+
+    session.events.iteration_completed.emit({});
+    try std.testing.expectEqual(@as(u32, 2), session.stores.message_count.get());
+
+    session.events.iteration_completed.emit({});
+    try std.testing.expectEqual(@as(u32, 3), session.stores.message_count.get());
 }

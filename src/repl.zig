@@ -872,9 +872,6 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         .text = .{ .role = .system, .content = resolved.config.system_prompt },
     });
 
-    // Session-level tool permission
-    var permission_level: tools.PermissionLevel = .none;
-
     while (true) {
         // Check for terminal resize
         if (sigwinch_received.swap(false, .acquire)) {
@@ -933,6 +930,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         // Clear cancel flag at start of each user message
         io.clearCancelFlag();
 
+        // Signal new user message — resets $iterations store
+        session.events.user_message_sent.emit({});
+
         // Agentic loop: keep calling LLM until we get a text response
         var iterations: usize = 0;
         while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
@@ -977,19 +977,38 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 break;
             }
 
-            // Track token usage
+            // Track token usage — tokens_received triggers compaction check via sample+filter
             if (result.usage) |usage| {
                 session.events.tokens_received.emit(.{
                     .prompt_tokens = usage.prompt_tokens,
                     .completion_tokens = usage.completion_tokens,
                 });
 
-                // Context window warnings and compaction
+                // Context window warning at 80%
                 const max_ctx = resolved.config.max_context_tokens;
                 if (max_ctx > 0 and usage.prompt_tokens > 0) {
                     const pct = (@as(u64, usage.prompt_tokens) * 100) / @as(u64, max_ctx);
-                    if (pct >= 90 and history.items.len > 5) {
-                        // Compact: keep system prompt [0] + last 4 messages
+                    if (pct >= 80 and pct < 90) {
+                        io.printOut("\x1b[33m[warning: {d}% context window used ({d}k/{d}k tokens)]\x1b[0m\r\n", .{
+                            pct,
+                            usage.prompt_tokens / 1000,
+                            max_ctx / 1000,
+                        }) catch {};
+                    }
+                }
+            }
+
+            // Signal iteration completed (updates $iterations store)
+            session.events.iteration_completed.emit({});
+
+            // Context compaction: check token usage against context limit
+            {
+                const max_ctx = resolved.config.max_context_tokens;
+                const total = session.stores.total_tokens.get();
+                const msgs = session.stores.message_count.get();
+                if (max_ctx > 0 and total > 0) {
+                    const pct = (total * 100) / @as(u64, max_ctx);
+                    if (pct >= 90 and msgs > 5 and history.items.len > 5) {
                         const keep_tail: usize = 4;
                         const remove_end = history.items.len - keep_tail;
                         if (remove_end > 1) {
@@ -1001,12 +1020,6 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                             history.shrinkRetainingCapacity(1 + keep_tail);
                             io.printOut("\x1b[33m[context compacted: dropped {d} old messages]\x1b[0m\r\n", .{removed_count}) catch {};
                         }
-                    } else if (pct >= 80) {
-                        io.printOut("\x1b[33m[warning: {d}% context window used ({d}k/{d}k tokens)]\x1b[0m\r\n", .{
-                            pct,
-                            usage.prompt_tokens / 1000,
-                            max_ctx / 1000,
-                        }) catch {};
                     }
                 }
             }
@@ -1021,7 +1034,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                 },
                 .tool_calls => |tcs| {
                     // Ask permission on first tool use in session
-                    if (permission_level == .none) {
+                    if (session.stores.permission.get() == .none) {
                         session.events.phase_changed.emit(.awaiting_permission);
                         io.writeOut("\r\n") catch {};
                         for (tcs) |tc| {
@@ -1043,8 +1056,8 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                         }
                         io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
 
-                        permission_level = repl.readPermission() catch .none;
-                        session.events.permission_granted.emit(permission_level);
+                        const perm = repl.readPermission() catch .none;
+                        session.events.permission_granted.emit(perm);
 
                         // Check if ESC triggered cancel during permission prompt
                         if (io.isCancelRequested()) {
@@ -1061,7 +1074,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                             break;
                         }
 
-                        if (permission_level == .none) {
+                        if (session.stores.permission.get() == .none) {
                             // Deny all tools
                             try history.append(allocator, .{
                                 .tool_use = .{ .tool_calls = tcs },
@@ -1098,7 +1111,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
 
                     // First pass: check permissions, print status, fill denied results
                     for (tcs, 0..) |tc, i| {
-                        if (!tools.isAllowed(tc.function.name, permission_level)) {
+                        if (!tools.isAllowed(tc.function.name, session.stores.permission.get())) {
                             io.printOut("\x1b[31m  \xe2\x8a\x98 {s} (not allowed)\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
                             tool_results[i] = .{
                                 .tool_call_id = try allocator.dupe(u8, tc.id),
@@ -1163,7 +1176,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                     .allocator = allocator,
                                     .tc = tcs[idx],
                                     .resolved = resolved,
-                                    .permission = permission_level,
+                                    .permission = session.stores.permission.get(),
                                 },
                                 &tool_results[idx],
                                 &done_flags[j],
@@ -1176,7 +1189,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                                         .allocator = allocator,
                                         .tc = tcs[idx],
                                         .resolved = resolved,
-                                        .permission = permission_level,
+                                        .permission = session.stores.permission.get(),
                                     },
                                     &tool_results[idx],
                                     &done_flags[j],
