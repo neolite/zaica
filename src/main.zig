@@ -55,4 +55,5 @@ test {
     _ = @import("tools.zig");
     _ = @import("agent.zig");
     _ = @import("session.zig");
+    _ = @import("chain.zig");
 }
