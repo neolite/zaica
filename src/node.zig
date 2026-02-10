@@ -285,6 +285,9 @@ fn runInner(
                 };
             },
             .tool_calls => |tcs| {
+                // Stop the "Thinking..." spinner before tool processing
+                if (hooks.on_llm_end) |cb| cb();
+
                 // Get effective permission (may prompt user in terminal mode)
                 const effective_permission = if (hooks.on_tool_calls) |cb|
                     cb(tcs)
@@ -362,6 +365,8 @@ fn runInner(
                 } else {
                     // Parallel execution for terminal mode
                     try executeToolsParallel(allocator, resolved, tcs, tool_results, effective_permission, hooks);
+                    // Stop spinner started by on_tool_calls hook
+                    if (hooks.on_llm_end) |cb| cb();
                 }
 
                 // Check cancel after tool execution

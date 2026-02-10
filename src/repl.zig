@@ -9,6 +9,7 @@ const tools = @import("tools.zig");
 const state = @import("state.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
+const node = @import("node.zig");
 
 /// Key event from terminal input.
 const InputKey = union(enum) {
@@ -893,6 +894,215 @@ const SEPARATOR = "";
 
 // StatusBar is now managed reactively via src/state.zig (zefx stores + watchers).
 
+// ── File-level context for node.zig hooks ────────────────────────────
+
+/// Context shared between the REPL and node.zig hook functions.
+/// Set before each call to node.run() so hooks can access REPL state.
+const ReplContext = struct {
+    allocator: std.mem.Allocator,
+    sess_state: *state.SessionState,
+    current_session_id: ?[]const u8,
+    repl: *Repl,
+    resolved: *const config_types.ResolvedConfig,
+};
+
+var repl_ctx: ReplContext = undefined;
+
+fn hookLlmStart() void {
+    repl_ctx.sess_state.events.phase_changed.emit(.streaming);
+    state.syncStatus(repl_ctx.sess_state);
+    io.startSpinner("Thinking...");
+}
+
+fn hookLlmEnd() void {
+    io.stopSpinner();
+}
+
+fn hookTokens(usage: node.TokenUsage) void {
+    repl_ctx.sess_state.events.tokens_received.emit(.{
+        .prompt_tokens = usage.prompt_tokens,
+        .completion_tokens = usage.completion_tokens,
+        .reasoning_tokens = usage.reasoning_tokens,
+        .cache_read_tokens = usage.cache_read_tokens,
+        .cache_write_tokens = usage.cache_write_tokens,
+    });
+
+    // Context window warning at 80%
+    const max_ctx = repl_ctx.resolved.config.max_context_tokens;
+    if (max_ctx > 0 and usage.prompt_tokens > 0) {
+        const pct = (@as(u64, usage.prompt_tokens) * 100) / @as(u64, max_ctx);
+        if (pct >= 80 and pct < 90) {
+            io.printOut("\x1b[33m[warning: {d}% context window used ({d}k/{d}k tokens)]\x1b[0m\r\n", .{
+                pct,
+                usage.prompt_tokens / 1000,
+                max_ctx / 1000,
+            }) catch {};
+        }
+    }
+}
+
+fn hookIteration() void {
+    repl_ctx.sess_state.events.iteration_completed.emit({});
+}
+
+fn hookText(_: []const u8) void {
+    io.writeOut("\r\n") catch {};
+}
+
+fn hookToolCalls(tcs: []const message.ToolCall) tools.PermissionLevel {
+    const alloc = repl_ctx.allocator;
+    const ss = repl_ctx.sess_state;
+
+    // Ask permission on first tool use in session
+    if (ss.stores.permission.get() == .none) {
+        ss.events.phase_changed.emit(.awaiting_permission);
+        io.writeOut("\r\n") catch {};
+        for (tcs) |tc| {
+            const risk = tools.toolRisk(tc.function.name);
+            const color: []const u8 = switch (risk) {
+                .safe => "\x1b[32m",
+                .write => "\x1b[33m",
+                .dangerous => "\x1b[31m",
+            };
+            io.writeOut("  ") catch {};
+            io.writeOut(color) catch {};
+            io.writeOut("\xe2\x9c\xa6 ") catch {}; // ✦
+            if (extractKeyArg(alloc, tc.function.name, tc.function.arguments)) |key_arg| {
+                defer alloc.free(key_arg);
+                io.printOut("{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc.function.name), key_arg }) catch {};
+            } else {
+                io.printOut("{s}\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
+            }
+        }
+        io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
+
+        const perm = repl_ctx.repl.readPermission() catch .none;
+        ss.events.permission_granted.emit(perm);
+        return ss.stores.permission.get();
+    }
+
+    // Display allowed tools with ✦ prefix
+    for (tcs) |tc| {
+        if (tools.isAllowed(tc.function.name, ss.stores.permission.get())) {
+            io.writeOut("  \x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
+            if (extractKeyArg(alloc, tc.function.name, tc.function.arguments)) |key_arg| {
+                defer alloc.free(key_arg);
+                io.printOut("\x1b[1m{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc.function.name), key_arg }) catch {};
+            } else {
+                io.printOut("\x1b[1m{s}\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
+            }
+        } else {
+            io.printOut("\x1b[31m  \xe2\x8a\x98 {s} (not allowed)\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
+        }
+    }
+
+    // Start spinner for tool execution phase
+    ss.events.phase_changed.emit(.executing_tools);
+
+    // Build label from display names: "Read, Bash"
+    var label_buf: [256]u8 = undefined;
+    var label_pos: usize = 0;
+    for (tcs) |tc| {
+        if (tools.isAllowed(tc.function.name, ss.stores.permission.get())) {
+            const name = tools.displayToolName(tc.function.name);
+            if (label_pos > 0) {
+                if (label_pos + 2 <= label_buf.len) {
+                    @memcpy(label_buf[label_pos..][0..2], ", ");
+                    label_pos += 2;
+                }
+            }
+            const copy_len = @min(name.len, label_buf.len - label_pos);
+            if (copy_len > 0) {
+                @memcpy(label_buf[label_pos..][0..copy_len], name[0..copy_len]);
+                label_pos += copy_len;
+            }
+        }
+    }
+    if (label_pos > 0) {
+        state.syncStatus(ss);
+        io.startSpinner(label_buf[0..label_pos]);
+    }
+
+    return ss.stores.permission.get();
+}
+
+fn hookToolResult(_: message.ToolCall, content: []const u8) void {
+    if (content.len == 0) return;
+    const max_preview = 1024;
+    const preview = if (content.len > max_preview) content[0..max_preview] else content;
+    const color: []const u8 = if (isErrorOutput(content)) "\x1b[31m" else "\x1b[2m";
+    io.writeOut("    \x1b[2m\xe2\x97\x87\x1b[0m ") catch {}; // dim ◇
+    io.writeOut(color) catch {};
+    io.writeText(preview) catch {};
+    if (content.len > max_preview) {
+        io.printOut("\r\n     ... ({d} bytes total)", .{content.len}) catch {};
+    }
+    io.writeOut("\x1b[0m\r\n") catch {};
+}
+
+fn hookCancel() void {
+    io.stopSpinner();
+    repl_ctx.sess_state.events.cancel_requested.emit(true);
+    io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
+    repl_ctx.sess_state.events.phase_changed.emit(.idle);
+}
+
+fn hookHttpError(status_code: u16, msg: []const u8) void {
+    io.stopSpinner();
+    io.printOut("\r\n\x1b[31m\xe2\x9c\xa6 HTTP {d} — {s}\x1b[0m\r\n\r\n", .{ status_code, msg }) catch {};
+}
+
+fn hookLoopDetected() ?[]const u8 {
+    io.writeOut("\x1b[33m[loop detected — injecting steering]\x1b[0m\r\n") catch {};
+    return repl_ctx.allocator.dupe(u8,
+        "[SYSTEM WARNING: You appear to be stuck in a loop, " ++
+        "repeating the same tool calls. Try a different approach, " ++
+        "read the error messages carefully, or ask the user for guidance.]",
+    ) catch null;
+}
+
+fn hookCompactionCheck(history: *std.ArrayList(message.ChatMessage)) void {
+    const max_ctx = repl_ctx.resolved.config.max_context_tokens;
+    const total = repl_ctx.sess_state.stores.total_tokens.get();
+    if (max_ctx > 0 and total > 0 and history.items.len > 6) {
+        const pct = (total * 100) / @as(u64, max_ctx);
+        if (pct >= 90) {
+            const half = history.items.len / 2;
+            const target_start = if (half < 2) @as(usize, 2) else half;
+
+            var safe_start: usize = target_start;
+            while (safe_start < history.items.len) {
+                switch (history.items[safe_start]) {
+                    .text => |tm| if (tm.role == .user) break,
+                    else => {},
+                }
+                safe_start += 1;
+            }
+
+            if (safe_start < history.items.len and safe_start > 1) {
+                const removed_count = safe_start - 1;
+                for (history.items[1..safe_start]) |msg| {
+                    freeMessage(repl_ctx.allocator, msg);
+                }
+                const kept_tail = history.items.len - safe_start;
+                std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[safe_start..]);
+                history.shrinkRetainingCapacity(1 + kept_tail);
+                io.printOut("\x1b[33m[context compacted: dropped {d} old messages, kept {d}]\x1b[0m\r\n", .{ removed_count, kept_tail }) catch {};
+            }
+        }
+    }
+}
+
+fn hookPersist(msg: message.ChatMessage) void {
+    if (repl_ctx.current_session_id) |sid| {
+        session.appendMessage(repl_ctx.allocator, sid, msg);
+    }
+}
+
+fn hookGetPermission() tools.PermissionLevel {
+    return repl_ctx.sess_state.stores.permission.get();
+}
+
 fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
     io.writeOut("  /help     — show this help\r\n") catch {};
@@ -910,56 +1120,10 @@ fn printHelp() void {
 /// Maximum number of agent iterations per user message.
 const MAX_AGENT_ITERATIONS = 25;
 
-/// Window size for loop detection (Attractor coding-agent-loop-spec).
-const LOOP_DETECTION_WINDOW = 10;
-
-/// Hash a tool call signature (name + args) for loop detection.
-fn hashToolSignature(name: []const u8, args: []const u8) u64 {
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(name);
-    hasher.update("|");
-    hasher.update(args);
-    return hasher.final();
-}
-
-/// Detect repeating patterns in a ring buffer of tool call hashes.
-/// Checks pattern lengths 1, 2, 3 — returns true if any pattern repeats
-/// enough to fill the window.
-fn detectLoop(ring: []const u64, count: usize) bool {
-    const window = @min(count, LOOP_DETECTION_WINDOW);
-    if (window < 4) return false; // need at least 4 calls for meaningful detection
-
-    const ring_len = ring.len;
-
-    // Get the last `window` entries from ring buffer
-    var recent: [LOOP_DETECTION_WINDOW]u64 = undefined;
-    var i: usize = 0;
-    while (i < window) : (i += 1) {
-        const idx = (count - window + i) % ring_len;
-        recent[i] = ring[idx];
-    }
-
-    // Check pattern lengths 1, 2, 3
-    for ([_]usize{ 1, 2, 3 }) |pattern_len| {
-        if (window % pattern_len != 0) continue;
-        if (window / pattern_len < 2) continue; // need at least 2 repetitions
-
-        const pattern = recent[0..pattern_len];
-        var all_match = true;
-        var chunk: usize = pattern_len;
-        while (chunk < window) : (chunk += pattern_len) {
-            for (0..pattern_len) |k| {
-                if (recent[chunk + k] != pattern[k]) {
-                    all_match = false;
-                    break;
-                }
-            }
-            if (!all_match) break;
-        }
-        if (all_match) return true;
-    }
-    return false;
-}
+// Loop detection and tool hashing moved to node.zig — aliases for tests.
+const LOOP_DETECTION_WINDOW = node.LOOP_DETECTION_WINDOW;
+const hashToolSignature = node.hashToolSignature;
+const detectLoop = node.detectLoop;
 
 /// Atomic flag for SIGWINCH (terminal resize).
 /// Print last N user/assistant text messages as a recap when resuming a session.
@@ -1359,487 +1523,42 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         // Signal new user message — resets $iterations store
         sess_state.events.user_message_sent.emit({});
 
-        // Steering queue — messages injected mid-loop (loop detection, future API)
-        var steering_queue: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (steering_queue.items) |s| allocator.free(s);
-            steering_queue.deinit(allocator);
-        }
+        // Set up file-level context for hook functions
+        repl_ctx = .{
+            .allocator = allocator,
+            .sess_state = &sess_state,
+            .current_session_id = current_session_id,
+            .repl = &repl,
+            .resolved = resolved,
+        };
 
-        // Loop detection ring buffer
-        var loop_ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
-        @memset(&loop_ring, 0);
-        var loop_ring_count: usize = 0;
-
-        // Agentic loop: keep calling LLM until we get a text response
-        var iterations: usize = 0;
-        agentic_loop: while (iterations < MAX_AGENT_ITERATIONS) : (iterations += 1) {
-            // Drain steering queue — inject as user-role messages
-            if (steering_queue.items.len > 0) {
-                for (steering_queue.items) |steer_msg| {
-                    try history.append(allocator, .{
-                        .text = .{ .role = .user, .content = steer_msg },
-                    });
-                }
-                // Clear without freeing — ownership transferred to history
-                steering_queue.clearRetainingCapacity();
-            }
-            // Terminal is in cooked mode here — streaming works normally
-            sess_state.events.phase_changed.emit(.streaming);
-            state.syncStatus(&sess_state);
-            io.startSpinner("Thinking...");
-            const result = result_blk: {
-                var llm_attempt: usize = 0;
-                while (true) : (llm_attempt += 1) {
-                    const r = client.chatMessages(
-                        allocator,
-                        resolved,
-                        history.items,
-                        tools.all_tools,
-                    ) catch {
-                        io.stopSpinner();
-                        if (iterations == 0) {
-                            if (history.pop()) |removed| {
-                                freeMessage(allocator, removed);
-                            }
-                        }
-                        break :agentic_loop;
-                    };
-                    switch (r.response) {
-                        .http_error => |detail| {
-                            const max_retries: usize = if (detail.status == 429) 3 else if (detail.status >= 500) 1 else 0;
-                            if (llm_attempt < max_retries and !io.isCancelRequested()) {
-                                const delay_ms: u64 = if (detail.status == 429)
-                                    @as(u64, 1000) << @intCast(llm_attempt)
-                                else
-                                    500;
-                                io.stopSpinner();
-                                io.printOut("\x1b[33m\xe2\x9c\xa6 HTTP {d} — retrying in {d}s...\x1b[0m\r\n", .{
-                                    detail.status,
-                                    delay_ms / 1000,
-                                }) catch {};
-                                allocator.free(detail.message);
-                                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
-                                io.startSpinner("Retrying...");
-                                continue;
-                            }
-                            break :result_blk r;
-                        },
-                        else => break :result_blk r,
-                    }
-                }
-            };
-
-            // Check cancel after LLM call returns
-            if (io.isCancelRequested()) {
-                io.stopSpinner();
-                sess_state.events.cancel_requested.emit(true);
-                io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
-                // Free partial result
-                switch (result.response) {
-                    .text => |t| allocator.free(t),
-                    .tool_calls => |tcs| {
-                        for (tcs) |tc| {
-                            allocator.free(tc.id);
-                            allocator.free(tc.function.name);
-                            allocator.free(tc.function.arguments);
-                        }
-                        allocator.free(tcs);
-                    },
-                    .http_error => |detail| allocator.free(detail.message),
-                }
-                sess_state.events.phase_changed.emit(.idle);
-                break;
-            }
-
-            // Track token usage — tokens_received triggers compaction check via sample+filter
-            if (result.usage) |usage| {
-                sess_state.events.tokens_received.emit(.{
-                    .prompt_tokens = usage.prompt_tokens,
-                    .completion_tokens = usage.completion_tokens,
-                    .reasoning_tokens = usage.reasoning_tokens,
-                    .cache_read_tokens = usage.cache_read_tokens,
-                    .cache_write_tokens = usage.cache_write_tokens,
-                });
-
-                // Context window warning at 80%
-                const max_ctx = resolved.config.max_context_tokens;
-                if (max_ctx > 0 and usage.prompt_tokens > 0) {
-                    const pct = (@as(u64, usage.prompt_tokens) * 100) / @as(u64, max_ctx);
-                    if (pct >= 80 and pct < 90) {
-                        io.printOut("\x1b[33m[warning: {d}% context window used ({d}k/{d}k tokens)]\x1b[0m\r\n", .{
-                            pct,
-                            usage.prompt_tokens / 1000,
-                            max_ctx / 1000,
-                        }) catch {};
-                    }
-                }
-            }
-
-            // Signal iteration completed (updates $iterations store)
-            sess_state.events.iteration_completed.emit({});
-
-            // Context compaction: drop older half of history when approaching limit.
-            // Keeps [system_prompt, ...recent_messages] with a safe cut point
-            // at a user message boundary to avoid orphaned tool_result/tool_use.
-            {
-                const max_ctx = resolved.config.max_context_tokens;
-                const total = sess_state.stores.total_tokens.get();
-                if (max_ctx > 0 and total > 0 and history.items.len > 6) {
-                    const pct = (total * 100) / @as(u64, max_ctx);
-                    if (pct >= 90) {
-                        // Target: keep roughly the last half of messages
-                        const half = history.items.len / 2;
-                        const target_start = if (half < 2) @as(usize, 2) else half;
-
-                        // Scan forward from target to find a user message (safe boundary)
-                        var safe_start: usize = target_start;
-                        while (safe_start < history.items.len) {
-                            switch (history.items[safe_start]) {
-                                .text => |tm| if (tm.role == .user) break,
-                                else => {},
-                            }
-                            safe_start += 1;
-                        }
-
-                        // If no user message found, skip compaction
-                        if (safe_start < history.items.len and safe_start > 1) {
-                            const removed_count = safe_start - 1;
-                            for (history.items[1..safe_start]) |msg| {
-                                freeMessage(allocator, msg);
-                            }
-                            const kept_tail = history.items.len - safe_start;
-                            std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[safe_start..]);
-                            history.shrinkRetainingCapacity(1 + kept_tail);
-                            io.printOut("\x1b[33m[context compacted: dropped {d} old messages, kept {d}]\x1b[0m\r\n", .{ removed_count, kept_tail }) catch {};
-                        }
-                    }
-                }
-            }
-
-            switch (result.response) {
-                .http_error => |detail| {
-                    io.stopSpinner();
-                    io.printOut("\r\n\x1b[31m\xe2\x9c\xa6 HTTP {d} — {s}\x1b[0m\r\n\r\n", .{
-                        detail.status, detail.message,
-                    }) catch {};
-                    allocator.free(detail.message);
-                    if (iterations == 0) {
-                        if (history.pop()) |removed| {
-                            freeMessage(allocator, removed);
-                        }
-                    }
-                    break;
-                },
-                .text => |text| {
-                    io.writeOut("\r\n") catch {};
-                    try history.append(allocator, .{
-                        .text = .{ .role = .assistant, .content = text },
-                    });
-                    if (current_session_id) |sid| {
-                        session.appendMessage(allocator, sid, .{ .text = .{ .role = .assistant, .content = text } });
-                    }
-                    break;
-                },
-                .tool_calls => |tcs| {
-                    // Ask permission on first tool use in session
-                    if (sess_state.stores.permission.get() == .none) {
-                        sess_state.events.phase_changed.emit(.awaiting_permission);
-                        io.writeOut("\r\n") catch {};
-                        for (tcs) |tc| {
-                            const risk = tools.toolRisk(tc.function.name);
-                            const color: []const u8 = switch (risk) {
-                                .safe => "\x1b[32m",
-                                .write => "\x1b[33m",
-                                .dangerous => "\x1b[31m",
-                            };
-                            io.writeOut("  ") catch {};
-                            io.writeOut(color) catch {};
-                            io.writeOut("\xe2\x9c\xa6 ") catch {}; // ✦
-                            if (extractKeyArg(allocator, tc.function.name, tc.function.arguments)) |key_arg| {
-                                defer allocator.free(key_arg);
-                                io.printOut("{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc.function.name), key_arg }) catch {};
-                            } else {
-                                io.printOut("{s}\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
-                            }
-                        }
-                        io.writeOut("Allow? [\x1b[32my\x1b[0m]es all / [\x1b[33ms\x1b[0m]afe only / [\x1b[31mn\x1b[0m]o ") catch {};
-
-                        const perm = repl.readPermission() catch .none;
-                        sess_state.events.permission_granted.emit(perm);
-
-                        // Check if ESC triggered cancel during permission prompt
-                        if (io.isCancelRequested()) {
-                            sess_state.events.cancel_requested.emit(true);
-                            io.writeOut("\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
-                            // Free tool calls
-                            for (tcs) |tc| {
-                                allocator.free(tc.id);
-                                allocator.free(tc.function.name);
-                                allocator.free(tc.function.arguments);
-                            }
-                            allocator.free(tcs);
-                            sess_state.events.phase_changed.emit(.idle);
-                            break;
-                        }
-
-                        if (sess_state.stores.permission.get() == .none) {
-                            // Deny all tools
-                            try history.append(allocator, .{
-                                .tool_use = .{ .tool_calls = tcs },
-                            });
-                            for (tcs) |tc| {
-                                const denied_id = try allocator.dupe(u8, tc.id);
-                                const denied_msg = try allocator.dupe(u8, "Permission denied by user.");
-                                try history.append(allocator, .{
-                                    .tool_result = .{
-                                        .tool_call_id = denied_id,
-                                        .content = denied_msg,
-                                    },
-                                });
-                            }
-                            continue;
-                        }
-                    }
-
-                    // Add assistant tool_use message to history
-                    try history.append(allocator, .{
-                        .tool_use = .{ .tool_calls = tcs },
-                    });
-                    if (current_session_id) |sid| {
-                        session.appendMessage(allocator, sid, .{ .tool_use = .{ .tool_calls = tcs } });
-                    }
-
-                    // Execute tools, checking per-tool permissions.
-                    // Multiple allowed tools run in parallel via std.Thread.
-                    const tool_results = try allocator.alloc(ToolResult, tcs.len);
-                    defer allocator.free(tool_results);
-                    @memset(tool_results, .{ .tool_call_id = "", .content = "", .sub_agent_usage = null });
-
-                    // Indices of allowed tools that need execution
-                    const thread_indices = try allocator.alloc(usize, tcs.len);
-                    defer allocator.free(thread_indices);
-                    var thread_count: usize = 0;
-
-                    // First pass: check permissions, print status, fill denied results
-                    for (tcs, 0..) |tc, i| {
-                        if (!tools.isAllowed(tc.function.name, sess_state.stores.permission.get())) {
-                            io.printOut("\x1b[31m  \xe2\x8a\x98 {s} (not allowed)\x1b[0m\r\n", .{tools.displayToolName(tc.function.name)}) catch {};
-                            tool_results[i] = .{
-                                .tool_call_id = try allocator.dupe(u8, tc.id),
-                                .content = std.fmt.allocPrint(allocator, "Permission denied: {s} requires full tool access (safe-only mode active).", .{tc.function.name}) catch try allocator.dupe(u8, "Permission denied."),
-                            };
-                        } else {
-                            thread_indices[thread_count] = i;
-                            thread_count += 1;
-                        }
-                    }
-
-                    // Display allowed tools with ✦ prefix
-                    if (thread_count > 0) {
-                        for (thread_indices[0..thread_count]) |idx| {
-                            const tc_disp = tcs[idx];
-                            io.writeOut("  \x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
-                            if (extractKeyArg(allocator, tc_disp.function.name, tc_disp.function.arguments)) |key_arg| {
-                                defer allocator.free(key_arg);
-                                io.printOut("\x1b[1m{s}\x1b[0m\x1b[2m({s})\x1b[0m\r\n", .{ tools.displayToolName(tc_disp.function.name), key_arg }) catch {};
-                            } else {
-                                io.printOut("\x1b[1m{s}\x1b[0m\r\n", .{tools.displayToolName(tc_disp.function.name)}) catch {};
-                            }
-                        }
-                    }
-
-                    // Execute allowed tools in background threads with spinner
-                    if (thread_count > 0) {
-                        sess_state.events.phase_changed.emit(.executing_tools);
-
-                        // Build label from display names: "Read, Bash"
-                        var label_buf: [256]u8 = undefined;
-                        var label_pos: usize = 0;
-                        for (thread_indices[0..thread_count]) |idx| {
-                            const name = tools.displayToolName(tcs[idx].function.name);
-                            if (label_pos > 0) {
-                                if (label_pos + 2 <= label_buf.len) {
-                                    @memcpy(label_buf[label_pos..][0..2], ", ");
-                                    label_pos += 2;
-                                }
-                            }
-                            const copy_len = @min(name.len, label_buf.len - label_pos);
-                            if (copy_len > 0) {
-                                @memcpy(label_buf[label_pos..][0..copy_len], name[0..copy_len]);
-                                label_pos += copy_len;
-                            }
-                        }
-                        state.syncStatus(&sess_state);
-                        io.startSpinner(label_buf[0..label_pos]);
-
-                        const threads = try allocator.alloc(?std.Thread, thread_count);
-                        defer allocator.free(threads);
-                        @memset(threads, null);
-
-                        // Atomic done flags for cancel-aware join
-                        const done_flags = try allocator.alloc(std.atomic.Value(bool), thread_count);
-                        defer allocator.free(done_flags);
-                        for (done_flags) |*f| f.* = std.atomic.Value(bool).init(false);
-
-                        for (thread_indices[0..thread_count], 0..) |idx, j| {
-                            threads[j] = std.Thread.spawn(.{}, executeToolThread, .{
-                                ToolExecContext{
-                                    .allocator = allocator,
-                                    .tc = tcs[idx],
-                                    .resolved = resolved,
-                                    .permission = sess_state.stores.permission.get(),
-                                },
-                                &tool_results[idx],
-                                &done_flags[j],
-                            }) catch null;
-
-                            // If spawn failed, run synchronously (done_flag already false)
-                            if (threads[j] == null) {
-                                executeToolThread(
-                                    ToolExecContext{
-                                        .allocator = allocator,
-                                        .tc = tcs[idx],
-                                        .resolved = resolved,
-                                        .permission = sess_state.stores.permission.get(),
-                                    },
-                                    &tool_results[idx],
-                                    &done_flags[j],
-                                );
-                            }
-                        }
-
-                        // Cancel-aware join: poll done flags + cancel flag
-                        var all_done = false;
-                        while (!all_done) {
-                            all_done = true;
-                            for (done_flags[0..thread_count]) |*f| {
-                                if (!f.load(.acquire)) {
-                                    all_done = false;
-                                    break;
-                                }
-                            }
-                            if (!all_done) {
-                                if (io.isCancelRequested()) break;
-                                std.Thread.sleep(50_000_000); // 50ms
-                            }
-                        }
-
-                        // Join all completed threads
-                        for (0..thread_count) |j| {
-                            if (done_flags[j].load(.acquire)) {
-                                if (threads[j]) |t| t.join();
-                            }
-                        }
-
-                        // Fill cancelled (incomplete) tool results
-                        if (!all_done) {
-                            for (thread_indices[0..thread_count], 0..) |idx, j| {
-                                if (!done_flags[j].load(.acquire)) {
-                                    tool_results[idx] = .{
-                                        .tool_call_id = allocator.dupe(u8, tcs[idx].id) catch "",
-                                        .content = allocator.dupe(u8, "[Cancelled]") catch "",
-                                    };
-                                }
-                            }
-                        }
-
-                        io.stopSpinner();
-
-                        // Emit accumulated sub-agent token usage to zefx
-                        for (tool_results) |tr| {
-                            if (tr.sub_agent_usage) |usage| {
-                                sess_state.events.tokens_received.emit(.{
-                                    .prompt_tokens = usage.prompt_tokens,
-                                    .completion_tokens = usage.completion_tokens,
-                                });
-                            }
-                        }
-                    }
-
-                    // Check cancel after tool execution
-                    if (io.isCancelRequested()) {
-                        sess_state.events.cancel_requested.emit(true);
-                        io.writeOut("\r\n\x1b[33m\xe2\x8a\x98 Cancelled\x1b[0m\r\n\r\n") catch {};
-                        // Still append results to history so LLM sees what happened
-                        for (tool_results) |tr| {
-                            if (tr.tool_call_id.len > 0) {
-                                try history.append(allocator, .{
-                                    .tool_result = .{
-                                        .tool_call_id = tr.tool_call_id,
-                                        .content = tr.content,
-                                    },
-                                });
-                            }
-                        }
-                        sess_state.events.phase_changed.emit(.idle);
-                        break;
-                    }
-
-                    // Print tool results with ◇ prefix
-                    for (0..tcs.len) |i| {
-                        const content = tool_results[i].content;
-                        if (content.len == 0) continue;
-                        // Truncate long output
-                        const max_preview = 1024;
-                        const preview = if (content.len > max_preview) content[0..max_preview] else content;
-                        const color: []const u8 = if (isErrorOutput(content)) "\x1b[31m" else "\x1b[2m";
-                        io.writeOut("    \x1b[2m\xe2\x97\x87\x1b[0m ") catch {}; // dim ◇
-                        io.writeOut(color) catch {};
-                        io.writeText(preview) catch {};
-                        if (content.len > max_preview) {
-                            io.printOut("\r\n     ... ({d} bytes total)", .{content.len}) catch {};
-                        }
-                        io.writeOut("\x1b[0m\r\n") catch {};
-                    }
-
-                    // Append all results to history (with LLM-facing truncation)
-                    for (tool_results, 0..) |tr, i| {
-                        const tool_name = if (i < tcs.len) tcs[i].function.name else "unknown";
-                        const truncated = tools.truncateToolOutput(allocator, tool_name, tr.content);
-                        const content = if (truncated.ptr != tr.content.ptr) blk: {
-                            // Truncation produced a new allocation — free original, use truncated
-                            allocator.free(tr.content);
-                            break :blk truncated;
-                        } else tr.content;
-                        try history.append(allocator, .{
-                            .tool_result = .{
-                                .tool_call_id = tr.tool_call_id,
-                                .content = content,
-                            },
-                        });
-                        if (current_session_id) |sid| {
-                            session.appendMessage(allocator, sid, .{
-                                .tool_result = .{ .tool_call_id = tr.tool_call_id, .content = content },
-                            });
-                        }
-
-                        // Record tool call hash for loop detection
-                        const args = if (i < tcs.len) tcs[i].function.arguments else "";
-                        loop_ring[loop_ring_count % LOOP_DETECTION_WINDOW] = hashToolSignature(tool_name, args);
-                        loop_ring_count += 1;
-                    }
-
-                    // Loop detection — check for repeating patterns
-                    if (detectLoop(&loop_ring, loop_ring_count)) {
-                        const warning = allocator.dupe(u8,
-                            "[SYSTEM WARNING: You appear to be stuck in a loop, " ++
-                            "repeating the same tool calls. Try a different approach, " ++
-                            "read the error messages carefully, or ask the user for guidance.]",
-                        ) catch null;
-                        if (warning) |w| {
-                            steering_queue.append(allocator, w) catch allocator.free(w);
-                        }
-                        io.writeOut("\x1b[33m[loop detected — injecting steering]\x1b[0m\r\n") catch {};
-                    }
-                },
-            }
-        }
+        // Run the agentic loop via node.zig
+        const node_result = node.run(allocator, resolved, .{
+            .system_prompt = resolved.config.system_prompt,
+            .tool_defs = tools.all_tools,
+            .max_iterations = MAX_AGENT_ITERATIONS,
+            .permission = sess_state.stores.permission.get(),
+            .silent = false,
+        }, &history, .{
+            .on_llm_start = &hookLlmStart,
+            .on_llm_end = &hookLlmEnd,
+            .on_tokens = &hookTokens,
+            .on_iteration = &hookIteration,
+            .on_text = &hookText,
+            .on_tool_calls = &hookToolCalls,
+            .on_tool_result = &hookToolResult,
+            .on_cancel = &hookCancel,
+            .on_http_error = &hookHttpError,
+            .on_loop_detected = &hookLoopDetected,
+            .on_compaction_check = &hookCompactionCheck,
+            .on_persist = &hookPersist,
+            .get_permission = &hookGetPermission,
+        });
 
         // Reset phase to idle when agentic loop exits
         sess_state.events.phase_changed.emit(.idle);
 
-        if (iterations >= MAX_AGENT_ITERATIONS) {
+        if (node_result.hit_limit) {
             io.writeOut("\x1b[33m(agent loop limit reached)\x1b[0m\r\n") catch {};
         }
     }
@@ -1851,64 +1570,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     }
 }
 
-/// Result of a single tool execution, used for parallel collection.
-const ToolResult = struct {
-    tool_call_id: []const u8,
-    content: []const u8,
-    /// Token usage from sub-agent execution (null for regular tools).
-    sub_agent_usage: ?struct { prompt_tokens: u64, completion_tokens: u64 } = null,
-};
-
-/// Context for tool execution threads — bundles all data needed by the thread.
-const ToolExecContext = struct {
-    allocator: std.mem.Allocator,
-    tc: message.ToolCall,
-    resolved: *const config_types.ResolvedConfig,
-    permission: tools.PermissionLevel,
-};
-
-/// Thread entry point for parallel tool execution.
-/// Routes dispatch_agent to the sub-agent runtime, all others to tools.execute.
-/// Sets done_flag when finished so the main thread can poll for completion.
-fn executeToolThread(ctx: ToolExecContext, result: *ToolResult, done_flag: *std.atomic.Value(bool)) void {
-    defer done_flag.store(true, .release);
-
-    if (std.mem.eql(u8, ctx.tc.function.name, "dispatch_agent")) {
-        // Extract "task" from JSON arguments
-        const task_text = extractTask(ctx.allocator, ctx.tc.function.arguments) orelse {
-            result.content = ctx.allocator.dupe(u8, "Error: missing or invalid 'task' argument") catch "";
-            result.tool_call_id = ctx.allocator.dupe(u8, ctx.tc.id) catch "";
-            return;
-        };
-        defer ctx.allocator.free(task_text);
-
-        const sub_result = agent.run(ctx.allocator, ctx.resolved, task_text, ctx.permission);
-        result.content = sub_result.text;
-        result.sub_agent_usage = .{
-            .prompt_tokens = sub_result.total_prompt_tokens,
-            .completion_tokens = sub_result.total_completion_tokens,
-        };
-    } else {
-        result.content = tools.execute(ctx.allocator, ctx.tc);
-    }
-    result.tool_call_id = ctx.allocator.dupe(u8, ctx.tc.id) catch "";
-}
-
-/// Extract the "task" string from dispatch_agent's JSON arguments.
-fn extractTask(allocator: std.mem.Allocator, args_json: []const u8) ?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const val = parsed.value.object.get("task") orelse return null;
-    if (val != .string or val.string.len == 0) return null;
-    return allocator.dupe(u8, val.string) catch null;
-}
-
-/// Truncate tool arguments for display (max 80 chars).
-fn truncateArgs(args: []const u8) []const u8 {
-    if (args.len <= 80) return args;
-    return args[0..80];
-}
+// ToolResult, ToolExecContext, executeToolThread, extractTask — moved to node.zig
 
 /// Extract the primary argument from a tool call's JSON args for display.
 /// Returns a short string like "src/main.zig" or "echo hello", truncated at 80 chars.
@@ -2011,28 +1673,7 @@ test "extractKeyArg: invalid JSON returns null" {
     try std.testing.expect(extractKeyArg(allocator, "read_file", "not json") == null);
 }
 
-test "extractTask: valid JSON" {
-    const allocator = std.testing.allocator;
-    const result = extractTask(allocator, "{\"task\":\"analyze this file\"}");
-    try std.testing.expect(result != null);
-    defer allocator.free(result.?);
-    try std.testing.expectEqualStrings("analyze this file", result.?);
-}
-
-test "extractTask: missing task key" {
-    const allocator = std.testing.allocator;
-    try std.testing.expect(extractTask(allocator, "{\"other\":\"value\"}") == null);
-}
-
-test "extractTask: invalid JSON" {
-    const allocator = std.testing.allocator;
-    try std.testing.expect(extractTask(allocator, "not json") == null);
-}
-
-test "extractTask: empty task" {
-    const allocator = std.testing.allocator;
-    try std.testing.expect(extractTask(allocator, "{\"task\":\"\"}") == null);
-}
+// extractTask tests moved to node.zig
 
 test "detectLoop: no loop with few calls" {
     var ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
