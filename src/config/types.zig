@@ -115,6 +115,8 @@ pub const CliArgs = struct {
     show_help: bool = false,
     continue_last: bool = false,
     session_id: ?[]const u8 = null,
+    chain_path: ?[]const u8 = null,
+    dry_run: bool = false,
     prompt: ?[]const u8 = null,
 };
 
@@ -125,6 +127,8 @@ pub const LoadResult = struct {
     prompt: ?[]const u8,
     continue_last: bool,
     session_id: ?[]const u8,
+    chain_path: ?[]const u8,
+    dry_run: bool,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadResult) void {

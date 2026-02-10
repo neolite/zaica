@@ -131,6 +131,8 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         .prompt = prompt,
         .continue_last = cli_args.continue_last,
         .session_id = if (cli_args.session_id) |s| try arena.allocator().dupe(u8, s) else null,
+        .chain_path = if (cli_args.chain_path) |p| try arena.allocator().dupe(u8, p) else null,
+        .dry_run = cli_args.dry_run,
         .arena = arena,
     };
 }

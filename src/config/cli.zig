@@ -77,6 +77,13 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
                     printFlagError("--session", "requires a session ID");
                     return error.MissingValue;
                 };
+            } else if (std.mem.eql(u8, arg, "--chain")) {
+                result.chain_path = args_iter.next() orelse {
+                    printFlagError("--chain", "requires a file path");
+                    return error.MissingValue;
+                };
+            } else if (std.mem.eql(u8, arg, "--dry-run")) {
+                result.dry_run = true;
             } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 result.show_help = true;
             } else {
@@ -121,6 +128,8 @@ const help_text =
     \\  --config <path>            Path to config file
     \\  -c, --continue             Resume the most recent session
     \\  --session <id>             Resume a specific session by ID
+    \\  --chain <path>             Run a chain pipeline from a .chain.md file
+    \\  --dry-run                  Print chain info and exit (use with --chain)
     \\  --dump-config              Print resolved configuration and exit
     \\  --init                     Create default config files in ~/.config/zc/
     \\  -h, --help                 Show this help
