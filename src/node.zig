@@ -26,6 +26,8 @@ pub const NodeResult = struct {
     cancelled: bool = false,
     /// Whether the iteration limit was reached without a text response.
     hit_limit: bool = false,
+    /// Whether an internal error occurred during execution.
+    errored: bool = false,
 };
 
 /// Configuration for an agent node.
@@ -111,7 +113,7 @@ pub fn run(
     hooks: Hooks,
 ) NodeResult {
     return runInner(allocator, resolved, config, history, hooks) catch {
-        return .{};
+        return .{ .errored = true };
     };
 }
 
@@ -274,8 +276,10 @@ fn runInner(
             .text => |text| {
                 if (hooks.on_llm_end) |cb| cb();
                 if (hooks.on_text) |cb| cb(text);
+                // Dupe for history so result.text is solely caller-owned
+                const history_copy = try allocator.dupe(u8, text);
                 try history.append(allocator, .{
-                    .text = .{ .role = .assistant, .content = text },
+                    .text = .{ .role = .assistant, .content = history_copy },
                 });
                 if (hooks.on_persist) |cb| cb(.{ .text = .{ .role = .assistant, .content = text } });
                 return .{

@@ -1558,6 +1558,9 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         // Reset phase to idle when agentic loop exits
         sess_state.events.phase_changed.emit(.idle);
 
+        // Free caller-owned text (history has its own copy)
+        if (node_result.text) |text| allocator.free(text);
+
         if (node_result.hit_limit) {
             io.writeOut("\x1b[33m(agent loop limit reached)\x1b[0m\r\n") catch {};
         }

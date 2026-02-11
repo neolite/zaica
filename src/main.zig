@@ -35,7 +35,8 @@ pub fn main() !void {
 
     if (result.chain_path) |chain_path| {
         // Chain mode
-        const parsed = chain.parseFile(allocator, chain_path) catch |err| {
+        const arena = result.arena.allocator();
+        const parsed = chain.parseFile(arena, chain_path) catch |err| {
             io.printErr("Failed to parse chain file '{s}': {}\n", .{ chain_path, err });
             std.process.exit(1);
         };

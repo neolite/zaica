@@ -4,7 +4,7 @@ name: code-review
 
 ## scout
 tools: read_file, search_files, list_files
-max_iterations: 5
+max_iterations: 15
 
 Analyze the codebase for {task}. Document all relevant files, functions, and patterns you find. Be thorough — the planner depends on your analysis.
 

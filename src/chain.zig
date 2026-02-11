@@ -82,7 +82,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) ParseError!Chain
 
     return .{
         .name = name,
-        .steps = steps_list.items,
+        .steps = steps_list.toOwnedSlice(allocator) catch return error.OutOfMemory,
     };
 }
 
@@ -254,6 +254,7 @@ pub fn execute(
 
         // Substitute variables in prompt
         const prompt = try substituteVars(allocator, step.prompt, task, previous);
+        defer allocator.free(prompt);
 
         // Resolve tool set for this step
         const step_tools = resolveTools(step.tools);
@@ -262,7 +263,7 @@ pub fn execute(
         var history: std.ArrayList(message.ChatMessage) = .empty;
         defer {
             for (history.items) |msg| {
-                // Don't free system prompt (it's the substituted prompt or comptime)
+                // Don't free system prompt (it's the substituted prompt, freed by defer above)
                 if (msg == .text and msg.text.role == .system) continue;
                 // Don't free the user task message (it's the original task slice)
                 if (msg == .text and msg.text.role == .user and std.mem.eql(u8, msg.text.content, task)) continue;
@@ -280,17 +281,26 @@ pub fn execute(
             .text = .{ .role = .user, .content = task },
         });
 
-        // Run the agentic loop
+        // Run the agentic loop with basic hooks for spinner management
         const result = node.run(allocator, resolved, .{
             .system_prompt = prompt,
             .tool_defs = step_tools,
             .max_iterations = step.max_iterations,
             .permission = permission,
             .silent = false,
-        }, &history, .{});
+        }, &history, .{
+            .on_llm_start = &chainLlmStart,
+            .on_llm_end = &chainLlmEnd,
+        });
 
         total_prompt += result.prompt_tokens;
         total_completion += result.completion_tokens;
+
+        if (result.errored) {
+            io.printOut("\r\n\x1b[31m\xe2\x9c\xa6 Step '{s}' encountered an internal error \xe2\x80\x94 aborting chain\x1b[0m\r\n", .{step.name}) catch {};
+            if (previous.len > 0) allocator.free(previous);
+            return null;
+        }
 
         if (result.cancelled) {
             io.printOut("\r\n\x1b[31m\xe2\x8a\x98 Chain cancelled\x1b[0m\r\n", .{}) catch {};
@@ -302,8 +312,25 @@ pub fn execute(
             // Free previous step output (if allocated)
             if (previous.len > 0) allocator.free(previous);
             previous = text;
+        } else if (result.hit_limit) {
+            // Iteration limit reached — try to extract last assistant text from history
+            const fallback = blk: {
+                if (extractLastAssistantText(&history)) |text| {
+                    break :blk allocator.dupe(u8, text) catch null;
+                }
+                break :blk collectToolResults(allocator, &history);
+            };
+            if (fallback) |text| {
+                io.printOut("\r\n\x1b[33m\xe2\x9c\xa6 Step '{s}' hit iteration limit, using partial output\x1b[0m\r\n", .{step.name}) catch {};
+                if (previous.len > 0) allocator.free(previous);
+                previous = text;
+            } else {
+                io.printOut("\r\n\x1b[33m\xe2\x9c\xa6 Step '{s}' produced no output — aborting chain\x1b[0m\r\n", .{step.name}) catch {};
+                if (previous.len > 0) allocator.free(previous);
+                return null;
+            }
         } else {
-            // Empty output — abort chain
+            // No output and no hit_limit — abort chain
             io.printOut("\r\n\x1b[33m\xe2\x9c\xa6 Step '{s}' produced no output — aborting chain\x1b[0m\r\n", .{step.name}) catch {};
             if (previous.len > 0) allocator.free(previous);
             return null;
@@ -345,6 +372,50 @@ pub fn printDryRun(chain: Chain) void {
     }
 }
 
+// ── Chain hooks ──────────────────────────────────────────────────────
+
+fn chainLlmStart() void {
+    io.startSpinner("Thinking...");
+}
+
+fn chainLlmEnd() void {
+    io.stopSpinner();
+}
+
+/// Walk history backwards to find the last assistant text message.
+fn extractLastAssistantText(history: *const std.ArrayList(message.ChatMessage)) ?[]const u8 {
+    var i: usize = history.items.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = history.items[i];
+        if (msg == .text and msg.text.role == .assistant and msg.text.content.len > 0) {
+            return msg.text.content;
+        }
+    }
+    return null;
+}
+
+/// Collect tool results from history as a concatenated summary.
+/// Used as fallback when hit_limit is reached but no assistant text was produced
+/// (e.g., scout step that spent all iterations gathering data via tools).
+/// Caller owns the returned slice.
+fn collectToolResults(allocator: std.mem.Allocator, history: *const std.ArrayList(message.ChatMessage)) ?[]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (history.items) |msg| {
+        if (msg == .tool_result and msg.tool_result.content.len > 0) {
+            if (buf.items.len > 0) {
+                buf.appendSlice(allocator, "\n\n") catch return null;
+            }
+            buf.appendSlice(allocator, msg.tool_result.content) catch return null;
+        }
+    }
+    if (buf.items.len == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "parse: single step" {
@@ -353,14 +424,15 @@ test "parse: single step" {
         \\
         \\Analyze the codebase for {task}.
     ;
-    const chain = try parse(std.testing.allocator, content);
-    try std.testing.expectEqual(@as(usize, 1), chain.steps.len);
-    try std.testing.expectEqualStrings("scout", chain.steps[0].name);
-    try std.testing.expectEqualStrings("unnamed", chain.name);
-    try std.testing.expect(chain.steps[0].tools == null);
-    try std.testing.expectEqual(@as(u16, 10), chain.steps[0].max_iterations);
+    const parsed = try parse(std.testing.allocator, content);
+    defer std.testing.allocator.free(parsed.steps);
+    try std.testing.expectEqual(@as(usize, 1), parsed.steps.len);
+    try std.testing.expectEqualStrings("scout", parsed.steps[0].name);
+    try std.testing.expectEqualStrings("unnamed", parsed.name);
+    try std.testing.expect(parsed.steps[0].tools == null);
+    try std.testing.expectEqual(@as(u16, 10), parsed.steps[0].max_iterations);
     // Prompt should contain the template variable
-    try std.testing.expect(std.mem.indexOf(u8, chain.steps[0].prompt, "{task}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.steps[0].prompt, "{task}") != null);
 }
 
 test "parse: full chain" {
@@ -385,12 +457,13 @@ test "parse: full chain" {
         \\
         \\Implement: {previous}
     ;
-    const chain = try parse(std.testing.allocator, content);
-    try std.testing.expectEqualStrings("code-review", chain.name);
-    try std.testing.expectEqual(@as(usize, 3), chain.steps.len);
-    try std.testing.expectEqualStrings("scout", chain.steps[0].name);
-    try std.testing.expectEqualStrings("planner", chain.steps[1].name);
-    try std.testing.expectEqualStrings("coder", chain.steps[2].name);
+    const parsed = try parse(std.testing.allocator, content);
+    defer std.testing.allocator.free(parsed.steps);
+    try std.testing.expectEqualStrings("code-review", parsed.name);
+    try std.testing.expectEqual(@as(usize, 3), parsed.steps.len);
+    try std.testing.expectEqualStrings("scout", parsed.steps[0].name);
+    try std.testing.expectEqualStrings("planner", parsed.steps[1].name);
+    try std.testing.expectEqualStrings("coder", parsed.steps[2].name);
 }
 
 test "parse: config keys" {
@@ -401,9 +474,10 @@ test "parse: config keys" {
         \\
         \\Do something.
     ;
-    const chain = try parse(std.testing.allocator, content);
-    try std.testing.expectEqualStrings("read_file, search_files, list_files", chain.steps[0].tools.?);
-    try std.testing.expectEqual(@as(u16, 5), chain.steps[0].max_iterations);
+    const parsed = try parse(std.testing.allocator, content);
+    defer std.testing.allocator.free(parsed.steps);
+    try std.testing.expectEqualStrings("read_file, search_files, list_files", parsed.steps[0].tools.?);
+    try std.testing.expectEqual(@as(u16, 5), parsed.steps[0].max_iterations);
 }
 
 test "parse: empty prompt error" {
