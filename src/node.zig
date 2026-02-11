@@ -138,6 +138,7 @@ fn runInner(
     var loop_ring: [LOOP_DETECTION_WINDOW]u64 = undefined;
     @memset(&loop_ring, 0);
     var loop_ring_count: usize = 0;
+    var loop_escalation: u8 = 0; // 3-tier escalation counter, reset per user message
 
     var iterations: usize = 0;
     while (iterations < config.max_iterations) : (iterations += 1) {
@@ -437,14 +438,36 @@ fn runInner(
                     loop_ring_count += 1;
                 }
 
-                // Loop detection
+                // Loop detection with 3-tier escalation
                 if (detectLoop(&loop_ring, loop_ring_count)) {
-                    if (hooks.on_loop_detected) |cb| {
+                    loop_escalation += 1;
+                    if (loop_escalation >= 3) {
+                        // Tier 3: Force break the loop — emit summary and stop
+                        const force_msg = allocator.dupe(u8,
+                            "[SYSTEM: LOOP BROKEN. You repeated the same tool calls 3 times. " ++
+                            "STOP using tools. Summarize what you were trying to do, " ++
+                            "what went wrong, and suggest what the user should do next.]",
+                        ) catch null;
+                        if (force_msg) |w| {
+                            steering_queue.append(allocator, w) catch allocator.free(w);
+                        }
+                    } else if (loop_escalation == 2) {
+                        // Tier 2: Stronger warning
+                        const strong_msg = allocator.dupe(u8,
+                            "[SYSTEM WARNING: STOP. You are repeating the same tool calls. " ++
+                            "Explain what's going wrong and try a COMPLETELY different strategy. " ++
+                            "Do NOT repeat any of the previous tool calls.]",
+                        ) catch null;
+                        if (strong_msg) |w| {
+                            steering_queue.append(allocator, w) catch allocator.free(w);
+                        }
+                    } else if (hooks.on_loop_detected) |cb| {
+                        // Tier 1: Use hook (existing behavior)
                         if (cb()) |w| {
                             steering_queue.append(allocator, w) catch allocator.free(w);
                         }
                     } else {
-                        // Default loop detection message
+                        // Tier 1: Default warning
                         const warning = allocator.dupe(u8,
                             "[SYSTEM WARNING: You appear to be stuck in a loop, " ++
                             "repeating the same tool calls. Try a different approach, " ++
@@ -530,39 +553,11 @@ fn executeToolsParallel(
         }
     }
 
-    // Cancel-aware join
-    var all_done = false;
-    while (!all_done) {
-        all_done = true;
-        for (done_flags[0..thread_count]) |*f| {
-            if (!f.load(.acquire)) {
-                all_done = false;
-                break;
-            }
-        }
-        if (!all_done) {
-            if (io.isCancelRequested()) break;
-            std.Thread.sleep(50_000_000); // 50ms
-        }
-    }
-
-    // Join completed threads
+    // Wait for all threads to finish. We MUST join every thread before returning
+    // because threads write to tool_results which lives on the caller's stack.
+    // Bash timeout ensures threads won't block forever.
     for (0..thread_count) |j| {
-        if (done_flags[j].load(.acquire)) {
-            if (threads[j]) |t| t.join();
-        }
-    }
-
-    // Fill cancelled (incomplete) tool results
-    if (!all_done) {
-        for (thread_indices[0..thread_count], 0..) |idx, j| {
-            if (!done_flags[j].load(.acquire)) {
-                tool_results[idx] = .{
-                    .tool_call_id = allocator.dupe(u8, tcs[idx].id) catch "",
-                    .content = allocator.dupe(u8, "[Cancelled]") catch "",
-                };
-            }
-        }
+        if (threads[j]) |t| t.join();
     }
 
     _ = hooks;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const message = @import("client/message.zig");
 const io = @import("io.zig");
+const skills = @import("skills.zig");
 
 /// Tool risk level for permission control.
 pub const ToolRisk = enum {
@@ -41,6 +42,7 @@ pub fn displayToolName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "list_files")) return "List";
     if (std.mem.eql(u8, name, "search_files")) return "Search";
     if (std.mem.eql(u8, name, "dispatch_agent")) return "Agent";
+    if (std.mem.eql(u8, name, "load_skill")) return "Skill";
     return name;
 }
 
@@ -78,7 +80,7 @@ pub fn printToolList() void {
 
 /// All tool definitions stored in a fixed-size array.
 /// First 5 are standard tools, [5] is dispatch_agent (excluded from sub-agent tools).
-const tools_array = [6]message.ToolDef{
+const tools_array = [7]message.ToolDef{
     .{ .function = .{
         .name = "execute_bash",
         .description = "Execute a bash command and return stdout+stderr. Has a 10-second timeout. Do NOT run interactive programs (editors, REPLs, servers) or 'zig build run' — they will be killed. Use for short commands: ls, cat, grep, git, zig build, etc.",
@@ -124,13 +126,28 @@ const tools_array = [6]message.ToolDef{
         \\{"type":"object","properties":{"task":{"type":"string","description":"A clear, self-contained task description for the sub-agent"}},"required":["task"]}
         ,
     } },
+    .{ .function = .{
+        .name = "load_skill",
+        .description = "Load a skill's full instructions by name. Use when you need specialized knowledge for a domain listed in the available-skills section of your system prompt.",
+        .parameters =
+        \\{"type":"object","properties":{"name":{"type":"string","description":"Skill name from the available-skills list"}},"required":["name"]}
+        ,
+    } },
 };
 
-/// All tool definitions for the main agent (includes dispatch_agent).
+/// All tool definitions for the main agent (includes dispatch_agent + load_skill).
 pub const all_tools: []const message.ToolDef = &tools_array;
 
-/// Tool definitions for sub-agents — excludes dispatch_agent to prevent recursion.
+/// Tool definitions for sub-agents — excludes dispatch_agent and load_skill.
 pub const sub_agent_tools: []const message.ToolDef = tools_array[0..5];
+
+/// Skill list pointer — set by the REPL at startup so load_skill can access it.
+var active_skills: []const skills.SkillInfo = &.{};
+
+/// Set the active skills list for load_skill tool execution.
+pub fn setActiveSkills(skill_list: []const skills.SkillInfo) void {
+    active_skills = skill_list;
+}
 
 /// Execute a tool call and return the result as a string.
 /// Errors are returned as error description strings (so the LLM can handle them).
@@ -151,6 +168,8 @@ fn executeInner(allocator: std.mem.Allocator, tc: message.ToolCall) ![]const u8 
         return listFiles(allocator, tc.function.arguments);
     } else if (std.mem.eql(u8, tc.function.name, "search_files")) {
         return searchFiles(allocator, tc.function.arguments);
+    } else if (std.mem.eql(u8, tc.function.name, "load_skill")) {
+        return executeLoadSkill(allocator, tc.function.arguments);
     } else {
         return std.fmt.allocPrint(allocator, "Unknown tool: {s}", .{tc.function.name});
     }
@@ -158,14 +177,19 @@ fn executeInner(allocator: std.mem.Allocator, tc: message.ToolCall) ![]const u8 
 
 // ── Tool implementations ────────────────────────────────────────────
 
-/// Default timeout for bash commands in seconds.
-const BASH_TIMEOUT_SECS = 10;
+/// Timeout for bash commands in seconds. Set via setBashTimeout().
+var bash_timeout_secs: u32 = 30;
+
+/// Set the bash command timeout (called from repl.zig at startup).
+pub fn setBashTimeout(secs: u32) void {
+    bash_timeout_secs = secs;
+}
 
 fn executeBash(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
     const args = try parseArgs(allocator, args_json);
     defer args.deinit();
     const command = getStr(args, "command") orelse return try allocator.dupe(u8, "Error: missing 'command' argument");
-    return runBashWithTimeout(allocator, command, BASH_TIMEOUT_SECS);
+    return runBashWithTimeout(allocator, command, bash_timeout_secs);
 }
 
 /// Run a bash command with a timeout. Exposed separately so tests can use short timeouts.
@@ -314,6 +338,17 @@ fn searchFiles(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 
     return result.stdout;
 }
 
+fn executeLoadSkill(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
+    const args = try parseArgs(allocator, args_json);
+    defer args.deinit();
+    const name = getStr(args, "name") orelse return try allocator.dupe(u8, "Error: missing 'name' argument");
+
+    if (skills.loadSkill(active_skills, name)) |content| {
+        return try allocator.dupe(u8, content);
+    }
+    return std.fmt.allocPrint(allocator, "Skill not found: '{s}'. Check the available-skills list in your system prompt.", .{name});
+}
+
 // ── JSON arg parsing helpers ─────────────────────────────────────────
 
 const ParsedArgs = std.json.Parsed(std.json.Value);
@@ -345,6 +380,7 @@ fn outputLimits(name: []const u8) OutputLimits {
     if (std.mem.eql(u8, name, "list_files")) return .{ .max_chars = 20_000, .max_lines = 500 };
     if (std.mem.eql(u8, name, "write_file")) return .{ .max_chars = 1_000, .max_lines = 0 };
     if (std.mem.eql(u8, name, "dispatch_agent")) return .{ .max_chars = 50_000, .max_lines = 0 };
+    if (std.mem.eql(u8, name, "load_skill")) return .{ .max_chars = 50_000, .max_lines = 0 };
     return .{ .max_chars = 30_000, .max_lines = 0 };
 }
 
@@ -540,9 +576,10 @@ test "displayToolName: dispatch_agent maps to Agent" {
     try std.testing.expectEqualStrings("Bash", displayToolName("execute_bash"));
 }
 
-test "sub_agent_tools: excludes dispatch_agent" {
+test "sub_agent_tools: excludes dispatch_agent and load_skill" {
     for (sub_agent_tools) |tool| {
         try std.testing.expect(!std.mem.eql(u8, tool.function.name, "dispatch_agent"));
+        try std.testing.expect(!std.mem.eql(u8, tool.function.name, "load_skill"));
     }
     try std.testing.expectEqual(@as(usize, 5), sub_agent_tools.len);
 }

@@ -3,9 +3,11 @@ const posix = std.posix;
 
 const config_types = @import("config/types.zig");
 const client = @import("client/mod.zig");
+const http_client = @import("client/http.zig");
 const message = client.message;
 const io = @import("io.zig");
 const tools = @import("tools.zig");
+const skills = @import("skills.zig");
 const state = @import("state.zig");
 const agent = @import("agent.zig");
 const session = @import("session.zig");
@@ -471,7 +473,7 @@ pub const Repl = struct {
     // ── Tab completion ─────────────────────────────────────────────────
 
     /// Available slash commands for tab completion.
-    const slash_commands = [_][]const u8{ "/exit", "/help", "/quit", "/sessions", "/tools", "/usage" };
+    const slash_commands = [_][]const u8{ "/compact", "/exit", "/help", "/quit", "/sessions", "/skills", "/tools", "/usage" };
 
     /// Attempt to complete a slash command from the current buffer prefix.
     /// If exactly one command matches, replaces buffer with it.
@@ -904,6 +906,7 @@ const ReplContext = struct {
     current_session_id: ?[]const u8,
     repl: *Repl,
     resolved: *const config_types.ResolvedConfig,
+    yolo: bool,
 };
 
 var repl_ctx: ReplContext = undefined;
@@ -953,8 +956,13 @@ fn hookToolCalls(tcs: []const message.ToolCall) tools.PermissionLevel {
     const alloc = repl_ctx.allocator;
     const ss = repl_ctx.sess_state;
 
+    // --yolo: auto-grant all permissions, skip prompt
+    if (repl_ctx.yolo) {
+        ss.events.permission_granted.emit(.all);
+    }
+
     // Ask permission on first tool use in session
-    if (ss.stores.permission.get() == .none) {
+    if (!repl_ctx.yolo and ss.stores.permission.get() == .none) {
         ss.events.phase_changed.emit(.awaiting_permission);
         io.writeOut("\r\n") catch {};
         for (tcs) |tc| {
@@ -981,9 +989,12 @@ fn hookToolCalls(tcs: []const message.ToolCall) tools.PermissionLevel {
         return ss.stores.permission.get();
     }
 
+    // Effective permission: yolo always .all, otherwise read from store
+    const eff_perm: tools.PermissionLevel = if (repl_ctx.yolo) .all else ss.stores.permission.get();
+
     // Display allowed tools with ✦ prefix
     for (tcs) |tc| {
-        if (tools.isAllowed(tc.function.name, ss.stores.permission.get())) {
+        if (tools.isAllowed(tc.function.name, eff_perm)) {
             io.writeOut("  \x1b[95m\xe2\x9c\xa6\x1b[0m ") catch {}; // magenta ✦
             if (extractKeyArg(alloc, tc.function.name, tc.function.arguments)) |key_arg| {
                 defer alloc.free(key_arg);
@@ -1003,7 +1014,7 @@ fn hookToolCalls(tcs: []const message.ToolCall) tools.PermissionLevel {
     var label_buf: [256]u8 = undefined;
     var label_pos: usize = 0;
     for (tcs) |tc| {
-        if (tools.isAllowed(tc.function.name, ss.stores.permission.get())) {
+        if (tools.isAllowed(tc.function.name, eff_perm)) {
             const name = tools.displayToolName(tc.function.name);
             if (label_pos > 0) {
                 if (label_pos + 2 <= label_buf.len) {
@@ -1023,6 +1034,8 @@ fn hookToolCalls(tcs: []const message.ToolCall) tools.PermissionLevel {
         io.startSpinner(label_buf[0..label_pos]);
     }
 
+    // In yolo mode, always return .all regardless of store state (emit may be async)
+    if (repl_ctx.yolo) return .all;
     return ss.stores.permission.get();
 }
 
@@ -1063,33 +1076,47 @@ fn hookLoopDetected() ?[]const u8 {
 
 fn hookCompactionCheck(history: *std.ArrayList(message.ChatMessage)) void {
     const max_ctx = repl_ctx.resolved.config.max_context_tokens;
-    const total = repl_ctx.sess_state.stores.total_tokens.get();
-    if (max_ctx > 0 and total > 0 and history.items.len > 6) {
-        const pct = (total * 100) / @as(u64, max_ctx);
-        if (pct >= 90) {
-            const half = history.items.len / 2;
-            const target_start = if (half < 2) @as(usize, 2) else half;
+    if (max_ctx == 0 or history.items.len <= 6) return;
 
-            var safe_start: usize = target_start;
-            while (safe_start < history.items.len) {
-                switch (history.items[safe_start]) {
-                    .text => |tm| if (tm.role == .user) break,
-                    else => {},
-                }
-                safe_start += 1;
-            }
-
-            if (safe_start < history.items.len and safe_start > 1) {
-                const removed_count = safe_start - 1;
-                for (history.items[1..safe_start]) |msg| {
-                    freeMessage(repl_ctx.allocator, msg);
-                }
-                const kept_tail = history.items.len - safe_start;
-                std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[safe_start..]);
-                history.shrinkRetainingCapacity(1 + kept_tail);
-                io.printOut("\x1b[33m[context compacted: dropped {d} old messages, kept {d}]\x1b[0m\r\n", .{ removed_count, kept_tail }) catch {};
-            }
+    // Estimate current context size from history content (not cumulative tokens)
+    var estimated: u64 = 0;
+    for (history.items) |msg| {
+        estimated += estimateMessageTokens(msg);
+    }
+    const pct = (estimated * 100) / @as(u64, max_ctx);
+    if (pct >= 85) {
+        // Keep only what fits in 70% of context (leave room for response + tools)
+        const budget: u64 = (max_ctx * 70) / 100;
+        // Scan from end to find how many recent messages fit
+        var tokens: u64 = estimateMessageTokens(history.items[0]); // system prompt
+        var keep_from: usize = history.items.len;
+        var i: usize = history.items.len;
+        while (i > 1) {
+            i -= 1;
+            const msg_tokens = estimateMessageTokens(history.items[i]);
+            if (tokens + msg_tokens > budget) break;
+            tokens += msg_tokens;
+            keep_from = i;
         }
+        // Advance to user message boundary
+        while (keep_from < history.items.len) {
+            switch (history.items[keep_from]) {
+                .text => |tm| if (tm.role == .user) break,
+                else => {},
+            }
+            keep_from += 1;
+        }
+        const safe_start = keep_from;
+        if (safe_start <= 1 or safe_start >= history.items.len) return;
+
+        const removed_count = safe_start - 1;
+        for (history.items[1..safe_start]) |msg| {
+            freeMessage(repl_ctx.allocator, msg);
+        }
+        const kept_tail = history.items.len - safe_start;
+        std.mem.copyForwards(message.ChatMessage, history.items[1..], history.items[safe_start..]);
+        history.shrinkRetainingCapacity(1 + kept_tail);
+        io.printOut("\x1b[33m[context compacted: dropped {d} messages, kept {d} (~{d}k tokens)]\x1b[0m\r\n", .{ removed_count, kept_tail, tokens / 1000 }) catch {};
     }
 }
 
@@ -1105,8 +1132,10 @@ fn hookGetPermission() tools.PermissionLevel {
 
 fn printHelp() void {
     io.writeOut("\r\n\x1b[1mCommands:\x1b[0m\r\n") catch {};
+    io.writeOut("  /compact  — summarize & compress context\r\n") catch {};
     io.writeOut("  /help     — show this help\r\n") catch {};
     io.writeOut("  /tools    — list available tools\r\n") catch {};
+    io.writeOut("  /skills   — list available skills\r\n") catch {};
     io.writeOut("  /usage    — show session token usage\r\n") catch {};
     io.writeOut("  /sessions — pick & load a session\r\n") catch {};
     io.writeOut("  /exit     — quit (also /quit, /q)\r\n") catch {};
@@ -1117,8 +1146,141 @@ fn printHelp() void {
     io.writeOut("\r\n") catch {};
 }
 
-/// Maximum number of agent iterations per user message.
-const MAX_AGENT_ITERATIONS = 25;
+/// /compact — summarize the current conversation via LLM and replace history.
+fn compactSession(
+    allocator: std.mem.Allocator,
+    resolved: *const config_types.ResolvedConfig,
+    history: *std.ArrayList(message.ChatMessage),
+    sess_state: *state.SessionState,
+    session_id: ?[]const u8,
+) void {
+    if (history.items.len <= 3) {
+        io.writeOut("\r\n\x1b[2mNothing to compact (too few messages).\x1b[0m\r\n\r\n") catch {};
+        return;
+    }
+
+    // Build a summary request: system prompt + all history as one user message
+    var summary_buf: std.ArrayList(u8) = .empty;
+    defer summary_buf.deinit(allocator);
+    const w = summary_buf.writer(allocator);
+
+    w.writeAll("Summarize this conversation concisely. Include:\n") catch return;
+    w.writeAll("- Key decisions and conclusions reached\n") catch return;
+    w.writeAll("- Important file paths, code changes, and tool results\n") catch return;
+    w.writeAll("- Current state of the task (what's done, what's pending)\n") catch return;
+    w.writeAll("- Any errors encountered and how they were resolved\n") catch return;
+    w.writeAll("\nKeep the summary dense and factual. Use bullet points.\n\n") catch return;
+    w.writeAll("--- CONVERSATION START ---\n") catch return;
+
+    for (history.items[1..]) |msg| {
+        switch (msg) {
+            .text => |tm| {
+                w.print("[{s}]: ", .{@tagName(tm.role)}) catch {};
+                w.writeAll(tm.content) catch {};
+                w.writeByte('\n') catch {};
+            },
+            .tool_use => |tu| {
+                for (tu.tool_calls) |tc| {
+                    w.print("[tool_call]: {s}({s})\n", .{ tc.function.name, tc.function.arguments }) catch {};
+                }
+            },
+            .tool_result => |tr| {
+                // Truncate long tool results in summary input
+                const max_result = @min(tr.content.len, 500);
+                w.print("[tool_result]: {s}", .{tr.content[0..max_result]}) catch {};
+                if (tr.content.len > 500) w.writeAll("...[truncated]") catch {};
+                w.writeByte('\n') catch {};
+            },
+        }
+    }
+    w.writeAll("--- CONVERSATION END ---\n") catch return;
+
+    io.writeOut("\r\n\x1b[33m\xe2\x9c\xa7 Compacting...\x1b[0m") catch {};
+
+    // Single LLM call for summary (no tools)
+    const summary_prompt = summary_buf.items;
+    var summary_messages = [_]message.ChatMessage{
+        .{ .text = .{ .role = .system, .content = "You are a conversation summarizer. Produce a concise summary of the given conversation." } },
+        .{ .text = .{ .role = .user, .content = summary_prompt } },
+    };
+
+    const body = message.buildRequestBody(allocator, .{
+        .model = resolved.resolved_model,
+        .messages = &summary_messages,
+        .max_tokens = 4096,
+        .temperature = 0.0,
+        .stream = true,
+    }) catch {
+        io.writeOut(" \x1b[31mfailed\x1b[0m\r\n\r\n") catch {};
+        return;
+    };
+    defer allocator.free(body);
+
+    const noop_cb = struct {
+        fn cb(_: []const u8) void {}
+    }.cb;
+    const result = http_client.streamChatCompletion(
+        allocator,
+        resolved.completions_url,
+        resolved.auth.api_key,
+        body,
+        &noop_cb,
+        true, // silent
+    ) catch {
+        io.writeOut(" \x1b[31mfailed\x1b[0m\r\n\r\n") catch {};
+        return;
+    };
+
+    const summary_text = switch (result.response) {
+        .text => |t| t,
+        else => {
+            io.writeOut(" \x1b[31mfailed\x1b[0m\r\n\r\n") catch {};
+            return;
+        },
+    };
+    defer allocator.free(summary_text);
+
+    // Track tokens
+    if (result.usage) |usage| {
+        sess_state.events.tokens_received.emit(.{
+            .prompt_tokens = usage.prompt_tokens,
+            .completion_tokens = usage.completion_tokens,
+            .reasoning_tokens = usage.reasoning_tokens,
+            .cache_read_tokens = usage.cache_read_tokens,
+            .cache_write_tokens = usage.cache_write_tokens,
+        });
+    }
+
+    // Replace history: keep system prompt, add summary as assistant message
+    const old_count = history.items.len - 1;
+    for (history.items[1..]) |msg| {
+        freeMessage(allocator, msg);
+    }
+    history.shrinkRetainingCapacity(1);
+
+    // Add summary as context
+    const summary_content = std.fmt.allocPrint(
+        allocator,
+        "[Previous conversation summary]\n{s}",
+        .{summary_text},
+    ) catch allocator.dupe(u8, summary_text) catch return;
+    history.append(allocator, .{
+        .text = .{ .role = .assistant, .content = summary_content },
+    }) catch {
+        allocator.free(summary_content);
+        return;
+    };
+
+    // Save summary to session file
+    if (session_id) |sid| {
+        session.writeSummary(allocator, sid, summary_text);
+    }
+
+    const new_tokens = estimateTokens(summary_content);
+    io.printOut(" \x1b[32mdone\x1b[0m ({d} messages → ~{d}k tokens)\r\n\r\n", .{ old_count, new_tokens / 1000 }) catch {};
+}
+
+// MAX_AGENT_ITERATIONS now comes from resolved.config.max_iterations
 
 // Loop detection and tool hashing moved to node.zig — aliases for tests.
 const LOOP_DETECTION_WINDOW = node.LOOP_DETECTION_WINDOW;
@@ -1190,7 +1352,7 @@ fn sigwinchHandler(_: c_int) callconv(.c) void {
 }
 
 /// Main REPL entry point — called from main.zig.
-pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig, continue_last: bool, cli_session_id: ?[]const u8) !void {
+pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedConfig, continue_last: bool, cli_session_id: ?[]const u8, yolo: bool, infinity: bool) !void {
     // Clear screen + cursor home — stay in main screen buffer so terminal scrollback works.
     // Unlike alternate screen (\x1b[?1049h), main buffer preserves content that scrolls
     // past the top of the scroll region, giving users mouse wheel + Shift+PgUp/PgDn for free.
@@ -1212,6 +1374,39 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
         resolved.resolved_model,
     }) catch {};
     io.writeText("\x1b[2mType /help for commands, /exit to quit.\x1b[0m\n\n") catch {};
+
+    // ── Autonomous mode banners ──────────────────────────────────────
+    if (yolo and infinity) {
+        io.writeText("\x1b[33;1m\xe2\x9a\xa0\xe2\x88\x9e Full autonomous mode — all tools auto-approved, no limits\x1b[0m\n\n") catch {};
+    } else if (yolo) {
+        io.writeText("\x1b[33;1m\xe2\x9a\xa0 --yolo — all tools auto-approved\x1b[0m\n\n") catch {};
+    } else if (infinity) {
+        io.writeText("\x1b[36;1m\xe2\x88\x9e --infinity — no iteration or timeout limits\x1b[0m\n\n") catch {};
+    }
+
+    // Apply bash timeout from config
+    tools.setBashTimeout(resolved.config.bash_timeout);
+
+    // ── Skills scanning ────────────────────────────────────────────────
+    const cwd_buf = std.fs.cwd().realpathAlloc(allocator, ".") catch null;
+    const skill_list = skills.scan(allocator, cwd_buf);
+    defer {
+        if (skill_list.len > 0) skills.freeSkills(allocator, skill_list);
+        if (cwd_buf) |b| allocator.free(b);
+    }
+    tools.setActiveSkills(skill_list);
+
+    // Build enhanced system prompt with skills
+    const skills_section = skills.buildPromptSection(allocator, skill_list);
+    defer if (skills_section.len > 0) allocator.free(skills_section);
+
+    const base_prompt = resolved.config.system_prompt;
+    const autonomous_suffix: []const u8 = if (yolo) config_types.AUTONOMOUS_SYSTEM_PROMPT else "";
+    const effective_system_prompt = if (skills_section.len > 0 or autonomous_suffix.len > 0)
+        std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base_prompt, autonomous_suffix, skills_section }) catch base_prompt
+    else
+        base_prompt;
+    defer if (effective_system_prompt.ptr != base_prompt.ptr) allocator.free(effective_system_prompt);
 
     var sess_state = state.init(allocator, resolved.resolved_model, resolved.config.max_context_tokens, term.rows, term.cols);
     state.bind(&sess_state); // Set stable pointer for watchers + initial render
@@ -1284,7 +1479,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     }
 
     try history.append(allocator, .{
-        .text = .{ .role = .system, .content = resolved.config.system_prompt },
+        .text = .{ .role = .system, .content = effective_system_prompt },
     });
 
     // Load resumed session messages (skip system prompt — use current one)
@@ -1310,8 +1505,47 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             };
             if (loaded) |*l| {
                 defer l.deinit(allocator);
-                // Skip system messages from loaded session — we use current system prompt
-                for (l.messages) |msg| {
+
+                // Determine how many messages from the tail fit in context.
+                // Reserve 20% of context for new conversation; use 80% for history.
+                const max_ctx = resolved.config.max_context_tokens;
+                const budget: u64 = if (max_ctx > 0) (max_ctx * 80) / 100 else 0;
+                // Estimate system prompt tokens
+                const sys_tokens = estimateTokens(effective_system_prompt);
+
+                // Find the start index: scan backwards, accumulating token estimate.
+                // Always start on a user message boundary for coherent context.
+                var start_idx: usize = 0;
+                if (budget > 0 and l.messages.len > 0) {
+                    var tokens: u64 = sys_tokens;
+                    var idx: usize = l.messages.len;
+                    while (idx > 0) {
+                        idx -= 1;
+                        const msg = l.messages[idx];
+                        // Skip system messages (we use current prompt)
+                        switch (msg) {
+                            .text => |tm| if (tm.role == .system) continue,
+                            else => {},
+                        }
+                        tokens += estimateMessageTokens(msg);
+                        if (tokens > budget) {
+                            idx += 1; // this message doesn't fit
+                            break;
+                        }
+                    }
+                    // Advance to next user message boundary for clean context
+                    while (idx < l.messages.len) {
+                        switch (l.messages[idx]) {
+                            .text => |tm| if (tm.role == .user) break,
+                            else => {},
+                        }
+                        idx += 1;
+                    }
+                    start_idx = idx;
+                }
+
+                // Load messages from start_idx onwards
+                for (l.messages[start_idx..]) |msg| {
                     switch (msg) {
                         .text => |tm| {
                             if (tm.role == .system) continue;
@@ -1352,8 +1586,13 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
                     }
                 }
                 const msg_count = history.items.len - 1; // minus system prompt
+                const total_msgs = l.messages.len;
                 if (msg_count > 0) {
-                    io.printOut("\x1b[2mResumed session {s} ({d} messages)\x1b[0m\r\n\r\n", .{ sid, msg_count }) catch {};
+                    if (start_idx > 0) {
+                        io.printOut("\x1b[2mResumed session {s} ({d}/{d} messages, trimmed to fit context)\x1b[0m\r\n\r\n", .{ sid, msg_count, total_msgs }) catch {};
+                    } else {
+                        io.printOut("\x1b[2mResumed session {s} ({d} messages)\x1b[0m\r\n\r\n", .{ sid, msg_count }) catch {};
+                    }
                     printRecentMessages(&history);
                 }
             }
@@ -1364,7 +1603,7 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
     if (!resumed_session) {
         if (current_session_id) |sid| {
             session.appendMessage(allocator, sid, .{
-                .text = .{ .role = .system, .content = resolved.config.system_prompt },
+                .text = .{ .role = .system, .content = effective_system_prompt },
             });
         }
     }
@@ -1488,6 +1727,14 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             }
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/skills")) {
+            skills.printSkillList(skill_list);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/compact")) {
+            compactSession(allocator, resolved, &history, &sess_state, current_session_id);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/usage")) {
             io.writeOut("\r\n\x1b[1mSession token usage:\x1b[0m\r\n") catch {};
             io.printOut("  Prompt tokens:     {d}\r\n", .{sess_state.stores.prompt_tokens.get()}) catch {};
@@ -1530,13 +1777,14 @@ pub fn run(allocator: std.mem.Allocator, resolved: *const config_types.ResolvedC
             .current_session_id = current_session_id,
             .repl = &repl,
             .resolved = resolved,
+            .yolo = yolo,
         };
 
         // Run the agentic loop via node.zig
         const node_result = node.run(allocator, resolved, .{
-            .system_prompt = resolved.config.system_prompt,
+            .system_prompt = effective_system_prompt,
             .tool_defs = tools.all_tools,
-            .max_iterations = MAX_AGENT_ITERATIONS,
+            .max_iterations = resolved.config.max_iterations,
             .permission = sess_state.stores.permission.get(),
             .silent = false,
         }, &history, .{
@@ -1593,6 +1841,8 @@ fn extractKeyArg(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
         "pattern"
     else if (std.mem.eql(u8, tool_name, "dispatch_agent"))
         "task"
+    else if (std.mem.eql(u8, tool_name, "load_skill"))
+        "name"
     else
         return null;
 
@@ -1601,6 +1851,26 @@ fn extractKeyArg(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
     const s = val.string;
     const max_len: usize = 80;
     return allocator.dupe(u8, if (s.len > max_len) s[0..max_len] else s) catch null;
+}
+
+/// Estimate token count from text length (~4 chars per token).
+fn estimateTokens(text: []const u8) u64 {
+    return (text.len + 3) / 4;
+}
+
+/// Estimate token count for a ChatMessage.
+fn estimateMessageTokens(msg: message.ChatMessage) u64 {
+    return switch (msg) {
+        .text => |tm| estimateTokens(tm.content) + 4, // role overhead
+        .tool_use => |tu| blk: {
+            var total: u64 = 4;
+            for (tu.tool_calls) |tc| {
+                total += estimateTokens(tc.id) + estimateTokens(tc.function.name) + estimateTokens(tc.function.arguments);
+            }
+            break :blk total;
+        },
+        .tool_result => |tr| estimateTokens(tr.content) + estimateTokens(tr.tool_call_id) + 4,
+    };
 }
 
 /// Check if tool output looks like an error.

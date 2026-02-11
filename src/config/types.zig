@@ -23,6 +23,21 @@ pub const ToolsConfig = struct {
 /// Fields with defaults serve as comptime layer-1 defaults.
 /// Base system prompt used when no explicit override is provided.
 /// Layered prompt construction appends provider/user/project layers to this.
+/// Additional system prompt appended in autonomous (--yolo) mode.
+pub const AUTONOMOUS_SYSTEM_PROMPT =
+    "\n\nYou are an autonomous coding agent. Work independently to complete tasks.\n\n" ++
+    "## Principles\n" ++
+    "- Break complex tasks into steps. Execute each step, verify, then proceed.\n" ++
+    "- When a tool fails, read the error carefully and try a different approach.\n" ++
+    "- Never repeat the same failing command — adapt.\n" ++
+    "- Use read_file and search_files to understand code before modifying it.\n" ++
+    "- After writing code, verify it compiles/works using execute_bash.\n" ++
+    "- If stuck after 3 attempts, explain what you tried and what's blocking you.\n\n" ++
+    "## Safety\n" ++
+    "- Never run rm -rf on directories you didn't create\n" ++
+    "- Always read a file before overwriting it\n" ++
+    "- Prefer targeted edits over full file rewrites";
+
 pub const BASE_SYSTEM_PROMPT =
     "You are a coding assistant with access to tools. " ++
     "Use tools when the user asks to read, write, or search files, run commands, or explore the codebase. " ++
@@ -41,6 +56,9 @@ pub const Config = struct {
     max_tokens: u32 = 8192,
     temperature: f64 = 0.0,
     max_context_tokens: u32 = 128000,
+    max_iterations: u32 = 200,
+    max_sub_agent_iterations: u32 = 50,
+    bash_timeout: u32 = 30,
     tools: ToolsConfig = .{},
     log_level: LogLevel = .info,
 };
@@ -117,6 +135,9 @@ pub const CliArgs = struct {
     session_id: ?[]const u8 = null,
     chain_path: ?[]const u8 = null,
     dry_run: bool = false,
+    yolo: bool = false,
+    infinity: bool = false,
+    max_iterations: ?u32 = null,
     prompt: ?[]const u8 = null,
 };
 
@@ -129,6 +150,8 @@ pub const LoadResult = struct {
     session_id: ?[]const u8,
     chain_path: ?[]const u8,
     dry_run: bool,
+    yolo: bool,
+    infinity: bool,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *LoadResult) void {

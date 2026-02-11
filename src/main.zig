@@ -81,7 +81,7 @@ pub fn main() !void {
         defer allocator.free(response);
     } else {
         // Interactive REPL mode
-        repl.run(allocator, &result.resolved, result.continue_last, result.session_id) catch |err| {
+        repl.run(allocator, &result.resolved, result.continue_last, result.session_id, result.yolo, result.infinity) catch |err| {
             io.printErr("REPL error: {}\n", .{err});
             std.process.exit(1);
         };
@@ -128,4 +128,5 @@ test {
     _ = @import("agent.zig");
     _ = @import("session.zig");
     _ = @import("chain.zig");
+    _ = @import("skills.zig");
 }

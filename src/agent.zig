@@ -11,8 +11,8 @@ const message = @import("client/message.zig");
 const tools = @import("tools.zig");
 const node = @import("node.zig");
 
-/// Maximum number of iterations per sub-agent.
-const MAX_SUB_AGENT_ITERATIONS = 10;
+/// Default maximum iterations per sub-agent (overridden by config).
+const DEFAULT_MAX_SUB_AGENT_ITERATIONS = 50;
 
 /// Result of a sub-agent execution.
 pub const SubAgentResult = struct {
@@ -64,11 +64,12 @@ pub fn run(
         return errorResult(allocator, "Sub-agent error: out of memory");
     };
 
-    // Run the generic agentic loop
+    // Run the generic agentic loop (use config limit if available, else default)
+    const max_iter = resolved.config.max_sub_agent_iterations;
     const result = node.run(allocator, resolved, .{
         .system_prompt = SUB_AGENT_SYSTEM_PROMPT,
         .tool_defs = tools.sub_agent_tools,
-        .max_iterations = MAX_SUB_AGENT_ITERATIONS,
+        .max_iterations = max_iter,
         .permission = permission,
         .silent = true,
     }, &history, .{});

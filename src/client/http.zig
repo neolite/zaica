@@ -162,6 +162,22 @@ pub fn streamChatCompletion(
         };
     }
 
+    // Cancel watchdog: a background thread that monitors the cancel flag and
+    // shuts down the socket to unblock any pending fillMore() read.
+    const socket_handle: ?std.posix.socket_t = if (req.connection) |conn|
+        conn.stream_reader.getStream().handle
+    else
+        null;
+    var watchdog_done = std.atomic.Value(bool).init(false);
+    const watchdog_thread = if (socket_handle) |handle|
+        std.Thread.spawn(.{}, cancelWatchdog, .{ handle, &watchdog_done }) catch null
+    else
+        null;
+    defer {
+        watchdog_done.store(true, .release);
+        if (watchdog_thread) |t| t.join();
+    }
+
     // Stream SSE response
     var response_buf: std.ArrayList(u8) = .empty;
     errdefer response_buf.deinit(allocator);
@@ -185,14 +201,10 @@ pub fn streamChatCompletion(
     var first_content = true;
     var final_usage: ?sse.TokenUsage = null;
 
-    while (try line_reader.nextLine(&line_buf)) |line| {
-        // Cancel check — poll ESC key directly (spinner may be stopped during streaming)
-        if (!silent and !io.isCancelRequested()) {
-            if (io.pollEscKeyFast()) {
-                io.setCancelFlag();
-            }
-        }
-        if (io.isCancelRequested()) break;
+    while (true) {
+        // When cancel watchdog shuts down the socket, fillMore() returns
+        // ReadFailed → nextLine returns null → we break out cleanly.
+        const line = (try line_reader.nextLine(&line_buf)) orelse break;
 
         if (first_line and line.len > 0 and line[0] == '{') {
             // Plain JSON response — likely an error
@@ -293,6 +305,16 @@ pub fn streamChatCompletion(
         }
     }
 
+    // If cancel was requested, shutdown the socket to prevent req.deinit()
+    // from blocking while trying to drain the remaining SSE stream.
+    // shutdown(SHUT_RDWR) makes any pending/future reads fail immediately.
+    if (io.isCancelRequested()) {
+        if (req.connection) |conn| {
+            const stream = conn.stream_reader.getStream();
+            std.posix.shutdown(stream.handle, .both) catch {};
+        }
+    }
+
     // If we accumulated tool calls, return those instead of text
     if (tc_accumulators.items.len > 0) {
         var tool_calls: std.ArrayList(message.ToolCall) = .empty;
@@ -329,6 +351,28 @@ fn ccToolName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "search_files")) return "Search";
     if (std.mem.eql(u8, name, "dispatch_agent")) return "Agent";
     return name;
+}
+
+/// Cancel watchdog thread: monitors the cancel flag and shuts down the socket
+/// to unblock any pending read in the SSE loop.
+/// Also polls ESC when spinner is inactive (during text streaming, spinner is stopped
+/// so nobody else checks for ESC).
+fn cancelWatchdog(handle: std.posix.socket_t, done: *std.atomic.Value(bool)) void {
+    while (!done.load(.acquire)) {
+        if (io.isCancelRequested()) {
+            std.posix.shutdown(handle, .both) catch {};
+            return;
+        }
+        // Poll ESC only when spinner is NOT active (avoid /dev/tty races)
+        if (!io.isSpinnerActive()) {
+            if (io.pollEscKeyFast()) {
+                io.setCancelFlag();
+                std.posix.shutdown(handle, .both) catch {};
+                return;
+            }
+        }
+        std.Thread.sleep(100_000_000); // 100ms
+    }
 }
 
 /// Try to extract error.message from a JSON error response.

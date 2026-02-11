@@ -116,6 +116,17 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         }
     }
 
+    // Apply --infinity overrides (iteration limits only — timeouts stay)
+    if (cli_args.infinity) {
+        resolved.config.max_iterations = std.math.maxInt(u32);
+        resolved.config.max_sub_agent_iterations = std.math.maxInt(u32);
+    }
+
+    // Apply --max-iterations CLI override (takes precedence over --infinity)
+    if (cli_args.max_iterations) |n| {
+        resolved.config.max_iterations = n;
+    }
+
     // Dupe prompt into arena so it's freed with everything else
     const prompt: ?[]const u8 = if (cli_args.prompt) |p|
         try arena.allocator().dupe(u8, p)
@@ -133,6 +144,8 @@ pub fn load(parent_allocator: std.mem.Allocator) !types.LoadResult {
         .session_id = if (cli_args.session_id) |s| try arena.allocator().dupe(u8, s) else null,
         .chain_path = if (cli_args.chain_path) |p| try arena.allocator().dupe(u8, p) else null,
         .dry_run = cli_args.dry_run,
+        .yolo = cli_args.yolo,
+        .infinity = cli_args.infinity,
         .arena = arena,
     };
 }

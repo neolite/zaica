@@ -512,7 +512,7 @@ test "substituteVars: empty previous" {
 
 test "resolveTools: null returns all" {
     const resolved = resolveTools(null);
-    try std.testing.expectEqual(@as(usize, 6), resolved.len);
+    try std.testing.expectEqual(@as(usize, 7), resolved.len);
 }
 
 test "resolveTools: filters correctly" {

@@ -84,6 +84,19 @@ pub fn parseFromIterator(allocator: std.mem.Allocator, args_iter: anytype) !type
                 };
             } else if (std.mem.eql(u8, arg, "--dry-run")) {
                 result.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--yolo") or std.mem.eql(u8, arg, "--dangerously-skip-permissions")) {
+                result.yolo = true;
+            } else if (std.mem.eql(u8, arg, "--infinity")) {
+                result.infinity = true;
+            } else if (std.mem.eql(u8, arg, "--max-iterations")) {
+                const val = args_iter.next() orelse {
+                    printFlagError("--max-iterations", "requires a value");
+                    return error.MissingValue;
+                };
+                result.max_iterations = std.fmt.parseInt(u32, val, 10) catch {
+                    printFlagError("--max-iterations", "must be a positive integer");
+                    return error.InvalidNumber;
+                };
             } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 result.show_help = true;
             } else {
@@ -130,6 +143,9 @@ const help_text =
     \\  --session <id>             Resume a specific session by ID
     \\  --chain <path>             Run a chain pipeline from a .chain.md file
     \\  --dry-run                  Print chain info and exit (use with --chain)
+    \\  --yolo                     Auto-approve all tool permissions (alias: --dangerously-skip-permissions)
+    \\  --infinity                 Remove iteration/timeout limits
+    \\  --max-iterations <int>     Max agent iterations per message (default: 200)
     \\  --dump-config              Print resolved configuration and exit
     \\  --init                     Create default config files in ~/.config/zc/
     \\  -h, --help                 Show this help
