@@ -45,7 +45,7 @@ pub const openrouter = ProviderPreset{
     .name = "openrouter",
     .base_url = "https://openrouter.ai/api/v1",
     .key_env_var = "OPENROUTER_API_KEY",
-    .default_model = "openrouter/aurora-alpha",
+    .default_model = "openrouter/hunter-alpha",
     .chat_completions_path = "/chat/completions",
     .requires_key = true,
 };
